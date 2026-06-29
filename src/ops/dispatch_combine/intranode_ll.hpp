@@ -242,7 +242,7 @@ __device__ inline void WriteDispDestTokIdMap(EpDispatchCombineArgs<T>& args, int
  *      enabling the load-once pattern without cross-block coordination.
  * ────────────────────────────────────────────────────────────────────────────── */
 template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   const int thdId = threadIdx.x;
@@ -393,7 +393,7 @@ __device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) 
 
             T* warpDstReg = nullptr;
             for (int i = 0; i < route.numDests; ++i) {
-              int d = (copyWarpRank & 1) ? (route.numDests - 1 - i) : i;
+              int d = (i + blockIdx.x) % route.numDests;
               int rankD = __builtin_amdgcn_readlane(warpDestRank, d);
               index_t slotD = __builtin_amdgcn_readlane(warpRecvSlot, d);
               if (laneId == i) {

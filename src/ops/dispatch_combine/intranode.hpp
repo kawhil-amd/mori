@@ -81,7 +81,7 @@ inline __device__ void CrossDeviceBarrierIntraNodeKernel(EpDispatchCombineArgs<T
 /* ---------------------------------------------------------------------------------------------- */
 
 template <typename T, bool EnableStdMoE = false>
-__device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
+__device__ void EpDispatchIntraNodeLLKernel_body(EpDispatchCombineArgs<T> args) {
   const EpDispatchCombineConfig& config = args.config;
 
   int thdId = threadIdx.x;
@@ -254,10 +254,10 @@ __device__ void EpDispatchIntraNodeKernel_body(EpDispatchCombineArgs<T> args) {
 #endif
 }
 
-template <typename T, bool EnableStdMoE = false>
-__global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
-  EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
-}
+// template <typename T, bool EnableStdMoE = false>
+// __global__ void EpDispatchIntraNodeKernel(EpDispatchCombineArgs<T> args) {
+//   EpDispatchIntraNodeKernel_body<T, EnableStdMoE>(args);
+// }
 
 /* ---------------------------------------------------------------------------------------------- */
 /*                                    EpCombineIntraNodeKernel                                    */
