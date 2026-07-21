@@ -57,7 +57,13 @@ from flydsl.expr.buffer_ops import (
 )
 from flydsl.expr.rocdl import ballot
 from flydsl.expr import rocdl, tdm_ops
+from flydsl.expr.typing import Int32, Int64
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
+from flydsl._mlir.dialects import arith as arith_d
+from flydsl._mlir.dialects import memref as memref_d
+from flydsl.expr import primitive as fly_prim
+from flydsl.expr.gpu import AddressSpace
+from flydsl.expr.typing import PointerType
 from mori.ops.dispatch_combine_v2.flydsl_prims import atomic_add_global
 
 
@@ -66,6 +72,30 @@ WGP_BARRIER_ID = -1
 
 def _ceildiv(a, b):
     return (a + b - 1) // b
+
+
+def _clamp_block_tok_count(inp_cur_tok, tok_start, tpb):
+    remaining = inp_cur_tok - tok_start
+    return arith.select(
+        remaining > fx.Int32(0),
+        arith.select(remaining < fx.Int32(tpb), remaining, fx.Int32(tpb)),
+        fx.Int32(0),
+    )
+
+
+
+
+def _global_tensor_from_addr(addr, outer, inner, elem_bytes):
+    elem_ty = T.i16() if elem_bytes == 2 else T.f32()
+    ptr_ty = PointerType.get(elem_ty, AddressSpace.Global)
+    ptr = fly_prim.inttoptr(ptr_ty, addr)
+    layout = fly_prim.make_layout((outer, inner), (inner, 1))
+    return fly_prim.make_view(ptr, layout)
+
+def _lds_atomic_add_i32(slot_ctr_view, dest_pe_k):
+    idx = arith.index_cast(T.index(), dest_pe_k)
+    old = memref_d.atomic_rmw(arith_d.AtomicRMWKind.addi, arith.constant(1), slot_ctr_view, [idx])
+    return fx.Int32(old)
 
 
 def build_ep_dispatch_tdm_kernel(
@@ -84,8 +114,6 @@ def build_ep_dispatch_tdm_kernel(
     topk = experts_per_token
     TPB = tokens_per_block
     nbytes = hidden_dim * elem_bytes
-    n_i32 = nbytes // 4
-
     toks_per_iter = warp_size // topk
     topk_mask = (1 << topk) - 1
 
@@ -96,6 +124,7 @@ def build_ep_dispatch_tdm_kernel(
     max_wt_iters = _ceildiv(TPB * topk, warp_size)
 
     warp_shift = int(math.log2(warp_size))
+    block_num = _ceildiv(max_recv, TPB)
 
     # ------------------------------------------------------------------
     # LDS Layout
@@ -128,27 +157,24 @@ def build_ep_dispatch_tdm_kernel(
     # ------------------------------------------------------------------
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def ep_dispatch_tdm(
-        addr_inp_tok: fx.Int64,
-        addr_inp_idx: fx.Int64,
-        addr_inp_wts: fx.Int64,
-        addr_p2p_out_tok: fx.Int64,
-        addr_p2p_tok_off: fx.Int64,
-        inp_cur_tok: fx.Int32,
+        addr_inp_tok: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_p2p_out_tok: Int64,
+        addr_p2p_tok_off: Int64,
+        inp_cur_tok: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         warp_id = tid >> warp_shift
         lane = tid & (warp_size - 1)
 
-        tok_start = bid * TPB
-        block_tok_count = arith.maxsi(
-            arith.minsi(fx.Int32(TPB), inp_cur_tok - tok_start),
-            fx.Int32(0),
-        )
+        tok_start = bid * fx.Int32(TPB)
+        block_tok_count = _clamp_block_tok_count(inp_cur_tok, tok_start, TPB)
 
         smem_base = lds.get_base()
 
-        total_work = block_tok_count * topk
+        total_work = block_tok_count * fx.Int32(topk)
         tpb_w1 = block_tok_count >> 1
         tpb_w3 = block_tok_count - tpb_w1
 
@@ -162,19 +188,19 @@ def build_ep_dispatch_tdm_kernel(
             pe_counts = [fx.Int32(0) for _ in range(npes)]
 
             for it in range_constexpr(max_slot_iters):
-                work_id = it * warp_size + lane
-                tok_global = tok_start + work_id // topk
+                work_id = fx.Int32(it * warp_size + lane)
+                tok_global = tok_start + work_id // fx.Int32(topk)
                 valid = (work_id < total_work) & (tok_global < inp_cur_tok)
 
-                idx_offset = tok_global * topk + (work_id % topk)
+                idx_offset = tok_global * fx.Int32(topk) + (work_id % fx.Int32(topk))
                 dest_expert = valid.select(
                     buffer_load(rsrc_idx, idx_offset, vec_width=1, dtype=T.i32()),
                     fx.Int32(0),
                 )
-                dest_pe = dest_expert // experts_per_rank
+                dest_pe = dest_expert // fx.Int32(experts_per_rank)
 
                 for pe in range_constexpr(npes):
-                    mask = ballot(valid & (dest_pe == pe))
+                    mask = ballot(T.i32(), valid & (dest_pe == fx.Int32(pe)))
                     # Count unique tokens, not raw lanes:
                     # each token occupies topk consecutive lanes in the ballot
                     for g in range_constexpr(toks_per_iter):
@@ -201,14 +227,11 @@ def build_ep_dispatch_tdm_kernel(
                     rsrc_p2p_out_tok, lane, vec_width=1, dtype=T.i64()
                 )
                 SmemPtr(
-                    smem_base, p2p_bases_off + lane * 8,
-                    T.i64(), shape=(1,),
-                ).store(p2p_addr, [0])
+                    smem_base, p2p_bases_off,
+                    T.i64(), shape=(npes,),
+                ).store(p2p_addr, [lane])
 
             rocdl.s_barrier_signal(WGP_BARRIER_ID)
-
-            # Phase 2: store weight/idx to remote (small data, VMEM path)
-            # (omitted: same as existing dispatch kernel's weight/idx P2P write)
 
         # ---- Warp 1: TDM engine 0 — first-half tokens ----
         if warp_id == 1:
@@ -219,7 +242,7 @@ def build_ep_dispatch_tdm_kernel(
             ).get()
 
             desc_load_w1 = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=addr_inp_tok,
+                global_ptr=_global_tensor_from_addr(addr_inp_tok, inp_cur_tok, hidden_dim, elem_bytes),
                 lds_memref=tok_buf_w1_memref,
                 global_offset=(tok_start, 0),
                 tensor_shape=(inp_cur_tok, hidden_dim),
@@ -238,40 +261,42 @@ def build_ep_dispatch_tdm_kernel(
             # Phase 2: read routing index, dedup, LDS atomic slot alloc, TDM store
             rsrc_idx_w1 = create_buffer_resource_from_addr(addr_inp_idx)
             for t in range_constexpr(max_tpb_w1):
-                tok_global_t = tok_start + t
+                tok_global_t = tok_start + fx.Int32(t)
                 if tok_global_t < inp_cur_tok:
                     for k in range_constexpr(topk):
                         dest_expert = buffer_load(
-                            rsrc_idx_w1, tok_global_t * topk + k,
-                            vec_width=1, dtype=T.i32(),
+                            rsrc_idx_w1,
+                            tok_global_t * fx.Int32(topk) + fx.Int32(k),
+                            vec_width=1,
+                            dtype=T.i32(),
                         )
-                        dest_pe_k = dest_expert // experts_per_rank
+                        dest_pe_k = dest_expert // fx.Int32(experts_per_rank)
 
-                        # Dedup: only first occurrence of dest_pe within this token
                         is_first = fx.Boolean(1)
-                        for prev in range_constexpr(k):
-                            prev_expert = buffer_load(
-                                rsrc_idx_w1, tok_global_t * topk + prev,
-                                vec_width=1, dtype=T.i32(),
-                            )
-                            prev_pe = prev_expert // experts_per_rank
-                            if prev_pe == dest_pe_k:
-                                is_first = fx.Boolean(0)
+                        for prev in range_constexpr(topk):
+                            if prev < k:
+                                prev_expert = buffer_load(
+                                    rsrc_idx_w1,
+                                    tok_global_t * fx.Int32(topk) + fx.Int32(prev),
+                                    vec_width=1,
+                                    dtype=T.i32(),
+                                )
+                                prev_pe = prev_expert // fx.Int32(experts_per_rank)
+                                if prev_pe == dest_pe_k:
+                                    is_first = fx.Boolean(0)
 
                         if is_first:
-                            # LDS atomic increment to get slot_id
                             slot_ctr_view = SmemPtr(
                                 smem_base, slot_ctr_off,
                                 T.i32(), shape=(npes,),
                             ).get()
-                            # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [dest_pe_k])
-                            slot_id = fx.Int32(0)  # placeholder
+                            slot_id = _lds_atomic_add_i32(slot_ctr_view, dest_pe_k)
 
                             remote_base = SmemPtr(
                                 smem_base, p2p_bases_off,
                                 T.i64(), shape=(npes,),
                             ).load([dest_pe_k])
-                            remote_addr = remote_base + fx.Int64(slot_id) * nbytes
+                            remote_addr = fx.Int64(remote_base) + fx.Int64(slot_id) * fx.Int64(nbytes)
 
                             tok_row_memref = SmemPtr(
                                 smem_base,
@@ -281,7 +306,7 @@ def build_ep_dispatch_tdm_kernel(
                             ).get()
 
                             desc_store = tdm_ops.make_tensor_descriptor_2d(
-                                global_ptr=remote_addr,
+                                global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
                                 lds_memref=tok_row_memref,
                                 global_offset=(0, 0),
                                 tensor_shape=(1, hidden_dim),
@@ -300,24 +325,22 @@ def build_ep_dispatch_tdm_kernel(
             # Phase 1: buffer_load weights -> LDS
             rsrc_wts = create_buffer_resource_from_addr(addr_inp_wts)
             for it in range_constexpr(max_wt_iters):
-                wt_work_id = it * warp_size + lane
-                tok_global_wt = tok_start + wt_work_id // topk
+                wt_work_id = fx.Int32(it * warp_size + lane)
+                tok_global_wt = tok_start + wt_work_id // fx.Int32(topk)
                 wt_valid = (wt_work_id < total_work) & (tok_global_wt < inp_cur_tok)
                 if wt_valid:
-                    wt_global_off = tok_global_wt * topk + (wt_work_id % topk)
+                    wt_global_off = tok_global_wt * fx.Int32(topk) + (
+                        wt_work_id % fx.Int32(topk)
+                    )
                     wt_val = buffer_load(
                         rsrc_wts, wt_global_off, vec_width=1, dtype=T.f32()
                     )
                     SmemPtr(
-                        smem_base, wt_buf_off + wt_work_id * 4,
-                        T.f32(), shape=(1,),
-                    ).store(arith.bitcast(T.i32(), wt_val), [0])
+                        smem_base, wt_buf_off,
+                        T.f32(), shape=(TPB * topk,),
+                    ).store(wt_val, [wt_work_id])
 
-            # Wait for warp 0's slot_table
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
-
-            # Phase 2: store weight/idx to remote (small data, VMEM path)
-            # (omitted: same as existing dispatch kernel's weight/idx P2P write)
 
         # ---- Warp 3: TDM engine 1 — second-half tokens ----
         if warp_id == 3:
@@ -328,7 +351,7 @@ def build_ep_dispatch_tdm_kernel(
             ).get()
 
             desc_load_w3 = tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=addr_inp_tok,
+                global_ptr=_global_tensor_from_addr(addr_inp_tok, inp_cur_tok, hidden_dim, elem_bytes),
                 lds_memref=tok_buf_w3_memref,
                 global_offset=(tok_start + tpb_w1, 0),
                 tensor_shape=(inp_cur_tok, hidden_dim),
@@ -347,38 +370,42 @@ def build_ep_dispatch_tdm_kernel(
             # Phase 2: read routing index, dedup, LDS atomic slot alloc, TDM store
             rsrc_idx_w3 = create_buffer_resource_from_addr(addr_inp_idx)
             for t in range_constexpr(max_tpb_w3):
-                tok_global_t = tok_start + tpb_w1 + t
+                tok_global_t = tok_start + tpb_w1 + fx.Int32(t)
                 if tok_global_t < inp_cur_tok:
                     for k in range_constexpr(topk):
                         dest_expert = buffer_load(
-                            rsrc_idx_w3, tok_global_t * topk + k,
-                            vec_width=1, dtype=T.i32(),
+                            rsrc_idx_w3,
+                            tok_global_t * fx.Int32(topk) + fx.Int32(k),
+                            vec_width=1,
+                            dtype=T.i32(),
                         )
-                        dest_pe_k = dest_expert // experts_per_rank
+                        dest_pe_k = dest_expert // fx.Int32(experts_per_rank)
 
                         is_first = fx.Boolean(1)
-                        for prev in range_constexpr(k):
-                            prev_expert = buffer_load(
-                                rsrc_idx_w3, tok_global_t * topk + prev,
-                                vec_width=1, dtype=T.i32(),
-                            )
-                            prev_pe = prev_expert // experts_per_rank
-                            if prev_pe == dest_pe_k:
-                                is_first = fx.Boolean(0)
+                        for prev in range_constexpr(topk):
+                            if prev < k:
+                                prev_expert = buffer_load(
+                                    rsrc_idx_w3,
+                                    tok_global_t * fx.Int32(topk) + fx.Int32(prev),
+                                    vec_width=1,
+                                    dtype=T.i32(),
+                                )
+                                prev_pe = prev_expert // fx.Int32(experts_per_rank)
+                                if prev_pe == dest_pe_k:
+                                    is_first = fx.Boolean(0)
 
                         if is_first:
                             slot_ctr_view = SmemPtr(
                                 smem_base, slot_ctr_off,
                                 T.i32(), shape=(npes,),
                             ).get()
-                            # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [dest_pe_k])
-                            slot_id = fx.Int32(0)  # placeholder
+                            slot_id = _lds_atomic_add_i32(slot_ctr_view, dest_pe_k)
 
                             remote_base = SmemPtr(
                                 smem_base, p2p_bases_off,
                                 T.i64(), shape=(npes,),
                             ).load([dest_pe_k])
-                            remote_addr = remote_base + fx.Int64(slot_id) * nbytes
+                            remote_addr = fx.Int64(remote_base) + fx.Int64(slot_id) * fx.Int64(nbytes)
 
                             tok_row_memref = SmemPtr(
                                 smem_base,
@@ -388,7 +415,7 @@ def build_ep_dispatch_tdm_kernel(
                             ).get()
 
                             desc_store = tdm_ops.make_tensor_descriptor_2d(
-                                global_ptr=remote_addr,
+                                global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
                                 lds_memref=tok_row_memref,
                                 global_offset=(0, 0),
                                 tensor_shape=(1, hidden_dim),
@@ -402,10 +429,38 @@ def build_ep_dispatch_tdm_kernel(
 
             tdm_ops.tensor_wait(0)
 
-    lds.finalized = False
-    lds.finalize()
+    @flyc.jit
+    def run(
+        addr_inp_tok: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_p2p_out_tok: Int64,
+        addr_p2p_tok_off: Int64,
+        inp_cur_tok: Int32,
+        stream=fx.Stream(None),
+    ):
+        if not lds.finalized:
+            from flydsl.compiler.kernel_function import CompilationContext
+            from flydsl._mlir import ir
 
-    return ep_dispatch_tdm
+            ctx = CompilationContext.get_current()
+            with ir.InsertionPoint(ctx.gpu_module_body):
+                lds.finalize()
+
+        ep_dispatch_tdm(
+            addr_inp_tok,
+            addr_inp_idx,
+            addr_inp_wts,
+            addr_p2p_out_tok,
+            addr_p2p_tok_off,
+            inp_cur_tok,
+        ).launch(
+            grid=(block_num, 1, 1),
+            block=[BLOCK_THREADS, 1, 1],
+            stream=stream,
+        )
+
+    return run
 
 
 # ==========================================================================
