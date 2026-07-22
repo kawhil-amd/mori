@@ -94,10 +94,24 @@ def _global_tensor_from_addr(addr, outer, inner, elem_bytes):
     layout = fly_prim.make_layout((outer, inner), (inner, 1))
     return fly_prim.make_view(ptr, layout)
 
-def _lds_atomic_add_i32(slot_ctr_view, dest_pe_k):
-    idx = arith.index_cast(T.index(), dest_pe_k)
-    old = memref_d.atomic_rmw(arith_d.AtomicRMWKind.addi, arith.constant(1), slot_ctr_view, [idx])
-    return fx.Int32(old)
+def _alloc_slot(slot_ctr_view, pe, pe_mask, lane):
+    """Allocate one destination slot for a (token, pe) pair, wave-uniformly.
+
+    ``slot_ctr_view`` is the per-PE LDS counter (initialised by warp 0 to the
+    remotely reserved base offset). Exactly one token must consume one slot, so
+    only the lowest set lane in ``pe_mask`` increments the counter by 1; all other
+    lanes add 0 (a no-op) so the whole wave can issue the LDS atomic without a
+    divergent ``scf.if`` (which would drop the SSA result). The leader's returned
+    base value is broadcast to every lane via ``readlane`` so the subsequent
+    wave-uniform TDM store uses a single, consistent slot id.
+    """
+    leader = fx.Int32(cttz(pe_mask))
+    addend = arith.select(lane == leader, fx.Int32(1), fx.Int32(0))
+    idx = arith.index_cast(T.index(), fx.Int32(pe))
+    old = memref_d.atomic_rmw(
+        arith_d.AtomicRMWKind.addi, addend, slot_ctr_view, [idx]
+    )
+    return fx.Int32(rocdl.readlane(T.i32(), old, leader))
 
 
 def build_ep_dispatch_tdm_kernel(
@@ -269,6 +283,12 @@ def build_ep_dispatch_tdm_kernel(
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
             tdm_ops.tensor_wait(0)
 
+            # Per-PE slot counter in LDS (warp 0 seeded it with the remotely
+            # reserved base offset). Shared with warp 3 via workgroup atomics.
+            slot_ctr_view = SmemPtr(
+                smem_base, slot_ctr_off, T.i32(), shape=(npes,),
+            ).get()
+
             # Phase 2: ballot dedup + TDM store (dest_pe already in VGPRs)
             for t in range_constexpr(max_tpb_w1):
                 tok_global_t = tok_start + t
@@ -280,12 +300,11 @@ def build_ep_dispatch_tdm_kernel(
                     # `pe_mask` is wave-uniform (ballot), so this branch is uniform.
                     # The TDM store is a wave-level DMA and MUST be issued wave-
                     # uniformly (like the load) — not from a single master lane, or
-                    # it never fires. All store params here are uniform (pe is a
-                    # constexpr, slot_id is the placeholder 0), so every lane issues
-                    # the same one store.
+                    # it never fires. All store params here are uniform, so every
+                    # lane issues the same one store.
                     if pe_mask != fx.Int32(0):
-                        # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
-                        slot_id = fx.Int32(0)  # placeholder
+                        # One token consumes one slot on this PE (wave-uniform).
+                        slot_id = _alloc_slot(slot_ctr_view, pe, pe_mask, lane)
 
                         remote_base = buffer_load(
                             rsrc_p2p_w1, pe, vec_width=1, dtype=T.i64(),
@@ -386,6 +405,12 @@ def build_ep_dispatch_tdm_kernel(
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
             tdm_ops.tensor_wait(0)
 
+            # Same per-PE LDS slot counter as warp 1 (workgroup-atomic increments
+            # keep the two warps' slot ids disjoint within each PE's range).
+            slot_ctr_view = SmemPtr(
+                smem_base, slot_ctr_off, T.i32(), shape=(npes,),
+            ).get()
+
             # Phase 2: ballot dedup + TDM store (dest_pe already in VGPRs)
             for t in range_constexpr(max_tpb_w3):
                 tok_global_t = tok_start + tpb_w1 + t
@@ -396,8 +421,8 @@ def build_ep_dispatch_tdm_kernel(
                     pe_mask = ballot(_BALLOT_INT(), valid_lane & (dest_pe == pe))
                     # Wave-uniform TDM store (see warp 1 note): issued by all lanes.
                     if pe_mask != fx.Int32(0):
-                        # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
-                        slot_id = fx.Int32(0)  # placeholder
+                        # One token consumes one slot on this PE (wave-uniform).
+                        slot_id = _alloc_slot(slot_ctr_view, pe, pe_mask, lane)
 
                         remote_base = buffer_load(
                             rsrc_p2p_w3, pe, vec_width=1, dtype=T.i64(),
