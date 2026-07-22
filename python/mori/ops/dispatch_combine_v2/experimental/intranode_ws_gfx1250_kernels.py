@@ -237,7 +237,11 @@ def build_ep_dispatch_tdm_kernel(
                 tile_shape=(max_tpb_w1, hidden_dim),
                 elem_bytes=elem_bytes,
                 num_warps=1,
-                oob_outer_bound=tpb_w1,
+                # oob_outer_bound is an ABSOLUTE global outer extent; the descriptor
+                # internally subtracts the tile start (outer_off = tok_start). Passing
+                # a relative count here would clip every block except bid==0 to zero
+                # rows. The end of warp 1's first-half range is tok_start + tpb_w1.
+                oob_outer_bound=tok_start + tpb_w1,
             )
             tdm_ops.tensor_load_2d(desc_load_w1)
 
@@ -351,7 +355,10 @@ def build_ep_dispatch_tdm_kernel(
                 tile_shape=(max_tpb_w3, hidden_dim),
                 elem_bytes=elem_bytes,
                 num_warps=1,
-                oob_outer_bound=tpb_w3,
+                # ABSOLUTE global extent (see warp 1). Warp 3 loads the second half
+                # starting at tok_start + tpb_w1, so its range ends at
+                # tok_start + tpb_w1 + tpb_w3 (= tok_start + block_tok_count).
+                oob_outer_bound=tok_start + tpb_w1 + tpb_w3,
             )
             tdm_ops.tensor_load_2d(desc_load_w3)
 
