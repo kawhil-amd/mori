@@ -68,6 +68,8 @@ from mori.ops.dispatch_combine_v2.flydsl_prims import atomic_add_global
 
 
 WGP_BARRIER_ID = -1
+WARP_SIZE = 32  # gfx1250 native wave32
+_BALLOT_INT = T.i64 if WARP_SIZE == 64 else T.i32
 
 
 def _ceildiv(a, b):
@@ -196,7 +198,7 @@ def build_ep_dispatch_tdm_kernel(
                 dest_pe = dest_expert // fx.Int32(experts_per_rank)
 
                 for pe in range_constexpr(npes):
-                    mask = ballot(valid & (dest_pe == pe))
+                    mask = ballot(_BALLOT_INT(), valid & (dest_pe == pe))
                     for g in range_constexpr(toks_per_iter):
                         group_bits = (mask >> (g * topk)) & topk_mask
                         pe_counts[pe] = pe_counts[pe] + arith.select(
@@ -268,7 +270,7 @@ def build_ep_dispatch_tdm_kernel(
                 dest_pe = w1_dest_pe[t]
 
                 for pe in range_constexpr(npes):
-                    pe_mask = ballot(valid_lane & (dest_pe == pe))
+                    pe_mask = ballot(_BALLOT_INT(), valid_lane & (dest_pe == pe))
                     if pe_mask != fx.Int32(0):
                         master = cttz(pe_mask)
                         if lane == master:
@@ -378,7 +380,7 @@ def build_ep_dispatch_tdm_kernel(
                 dest_pe = w3_dest_pe[t]
 
                 for pe in range_constexpr(npes):
-                    pe_mask = ballot(valid_lane & (dest_pe == pe))
+                    pe_mask = ballot(_BALLOT_INT(), valid_lane & (dest_pe == pe))
                     if pe_mask != fx.Int32(0):
                         master = cttz(pe_mask)
                         if lane == master:
