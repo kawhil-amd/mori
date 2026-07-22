@@ -259,7 +259,9 @@ def build_ep_dispatch_tdm_kernel(
                     dest_expert // experts_per_rank, fx.Int32(-1),
                 ))
 
-            # Wait for slot_ctr (warp 0) + TDM load
+            # Arrive (so the WG split barrier reaches its full 4-wave count),
+            # then wait for slot_ctr (warp 0) + TDM load.
+            rocdl.s_barrier_signal(WGP_BARRIER_ID)
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
             tdm_ops.tensor_wait(0)
 
@@ -271,40 +273,40 @@ def build_ep_dispatch_tdm_kernel(
 
                 for pe in range_constexpr(npes):
                     pe_mask = ballot(_BALLOT_INT(), valid_lane & (dest_pe == pe))
+                    # `pe_mask` is wave-uniform (ballot), so this branch is uniform.
+                    # The TDM store is a wave-level DMA and MUST be issued wave-
+                    # uniformly (like the load) — not from a single master lane, or
+                    # it never fires. All store params here are uniform (pe is a
+                    # constexpr, slot_id is the placeholder 0), so every lane issues
+                    # the same one store.
                     if pe_mask != fx.Int32(0):
-                        master = cttz(pe_mask)
-                        if lane == master:
-                            slot_ctr_view = SmemPtr(
-                                smem_base, slot_ctr_off,
-                                T.i32(), shape=(npes,),
-                            ).get()
-                            # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
-                            slot_id = fx.Int32(0)  # placeholder
+                        # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
+                        slot_id = fx.Int32(0)  # placeholder
 
-                            remote_base = buffer_load(
-                                rsrc_p2p_w1, pe, vec_width=1, dtype=T.i64(),
-                            )
-                            remote_addr = remote_base + fx.Int64(slot_id) * nbytes
+                        remote_base = buffer_load(
+                            rsrc_p2p_w1, pe, vec_width=1, dtype=T.i64(),
+                        )
+                        remote_addr = remote_base + fx.Int64(slot_id) * nbytes
 
-                            tok_row_memref = SmemPtr(
-                                smem_base,
-                                tok_buf_w1_off + t * nbytes,
-                                T.i16(),
-                                shape=(hidden_dim,),
-                            ).get()
+                        tok_row_memref = SmemPtr(
+                            smem_base,
+                            tok_buf_w1_off + t * nbytes,
+                            T.i16(),
+                            shape=(hidden_dim,),
+                        ).get()
 
-                            desc_store = tdm_ops.make_tensor_descriptor_2d(
-                                global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
-                                lds_memref=tok_row_memref,
-                                global_offset=(0, 0),
-                                tensor_shape=(1, hidden_dim),
-                                strides=(hidden_dim, 1),
-                                tile_shape=(1, hidden_dim),
-                                elem_bytes=elem_bytes,
-                                num_warps=1,
-                                for_store=True,
-                            )
-                            tdm_ops.tensor_store_2d(desc_store)
+                        desc_store = tdm_ops.make_tensor_descriptor_2d(
+                            global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
+                            lds_memref=tok_row_memref,
+                            global_offset=(0, 0),
+                            tensor_shape=(1, hidden_dim),
+                            strides=(hidden_dim, 1),
+                            tile_shape=(1, hidden_dim),
+                            elem_bytes=elem_bytes,
+                            num_warps=1,
+                            for_store=True,
+                        )
+                        tdm_ops.tensor_store_2d(desc_store)
 
             tdm_ops.tensor_wait(0)
 
@@ -328,6 +330,8 @@ def build_ep_dispatch_tdm_kernel(
                         T.f32(), shape=(TPB * topk,),
                     ).store(wt_val, [wt_work_id])
 
+            # Arrive at the WG split barrier (weight load done), then wait.
+            rocdl.s_barrier_signal(WGP_BARRIER_ID)
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
 
         # ---- Warp 3: TDM engine 1 — second-half tokens ----
@@ -369,7 +373,9 @@ def build_ep_dispatch_tdm_kernel(
                     dest_expert // experts_per_rank, fx.Int32(-1),
                 ))
 
-            # Wait for slot_ctr (warp 0) + TDM load
+            # Arrive (so the WG split barrier reaches its full 4-wave count),
+            # then wait for slot_ctr (warp 0) + TDM load.
+            rocdl.s_barrier_signal(WGP_BARRIER_ID)
             rocdl.s_barrier_wait(WGP_BARRIER_ID)
             tdm_ops.tensor_wait(0)
 
@@ -381,40 +387,35 @@ def build_ep_dispatch_tdm_kernel(
 
                 for pe in range_constexpr(npes):
                     pe_mask = ballot(_BALLOT_INT(), valid_lane & (dest_pe == pe))
+                    # Wave-uniform TDM store (see warp 1 note): issued by all lanes.
                     if pe_mask != fx.Int32(0):
-                        master = cttz(pe_mask)
-                        if lane == master:
-                            slot_ctr_view = SmemPtr(
-                                smem_base, slot_ctr_off,
-                                T.i32(), shape=(npes,),
-                            ).get()
-                            # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
-                            slot_id = fx.Int32(0)  # placeholder
+                        # slot_id = memref.atomic_rmw("addi", slot_ctr_view, 1, [pe])
+                        slot_id = fx.Int32(0)  # placeholder
 
-                            remote_base = buffer_load(
-                                rsrc_p2p_w3, pe, vec_width=1, dtype=T.i64(),
-                            )
-                            remote_addr = remote_base + fx.Int64(slot_id) * nbytes
+                        remote_base = buffer_load(
+                            rsrc_p2p_w3, pe, vec_width=1, dtype=T.i64(),
+                        )
+                        remote_addr = remote_base + fx.Int64(slot_id) * nbytes
 
-                            tok_row_memref = SmemPtr(
-                                smem_base,
-                                tok_buf_w3_off + t * nbytes,
-                                T.i16(),
-                                shape=(hidden_dim,),
-                            ).get()
+                        tok_row_memref = SmemPtr(
+                            smem_base,
+                            tok_buf_w3_off + t * nbytes,
+                            T.i16(),
+                            shape=(hidden_dim,),
+                        ).get()
 
-                            desc_store = tdm_ops.make_tensor_descriptor_2d(
-                                global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
-                                lds_memref=tok_row_memref,
-                                global_offset=(0, 0),
-                                tensor_shape=(1, hidden_dim),
-                                strides=(hidden_dim, 1),
-                                tile_shape=(1, hidden_dim),
-                                elem_bytes=elem_bytes,
-                                num_warps=1,
-                                for_store=True,
-                            )
-                            tdm_ops.tensor_store_2d(desc_store)
+                        desc_store = tdm_ops.make_tensor_descriptor_2d(
+                            global_ptr=_global_tensor_from_addr(remote_addr, 1, hidden_dim, elem_bytes),
+                            lds_memref=tok_row_memref,
+                            global_offset=(0, 0),
+                            tensor_shape=(1, hidden_dim),
+                            strides=(hidden_dim, 1),
+                            tile_shape=(1, hidden_dim),
+                            elem_bytes=elem_bytes,
+                            num_warps=1,
+                            for_store=True,
+                        )
+                        tdm_ops.tensor_store_2d(desc_store)
 
             tdm_ops.tensor_wait(0)
 
