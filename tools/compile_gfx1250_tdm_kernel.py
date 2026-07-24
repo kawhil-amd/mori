@@ -39,22 +39,20 @@ def _load_kernel_module():
 
 @flyc.jit
 def compile_only(
+    arena: Int64,
     addr_inp_tok: Int64,
     addr_inp_idx: Int64,
     addr_inp_wts: Int64,
-    addr_p2p_out_tok: Int64,
-    addr_p2p_tok_off: Int64,
     inp_cur_tok: Int32,
     stream=fx.Stream(None),
 ):
     mod = _load_kernel_module()
     run_fn = mod.build_ep_dispatch_tdm_kernel()
     run_fn(
+        arena,
         addr_inp_tok,
         addr_inp_idx,
         addr_inp_wts,
-        addr_p2p_out_tok,
-        addr_p2p_tok_off,
         inp_cur_tok,
         stream,
     )
@@ -64,7 +62,6 @@ def main() -> int:
     print(f"Compiling kernel from: {KERNEL_PATH}")
     compiled = flyc.compile(
         compile_only,
-        fx.Int64(0),
         fx.Int64(0),
         fx.Int64(0),
         fx.Int64(0),
