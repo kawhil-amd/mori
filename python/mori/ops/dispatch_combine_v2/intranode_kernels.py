@@ -576,6 +576,10 @@ def make_combine(
     reset_total_recv=True,
     _s3_cache=2,
     _unroll=2,
+    combine_cu_spread=False,
+    combine_spread_group=0,
+    waves_per_eu=0,
+    maxnreg=0,
 ):
     # Transport dtype = external dtype, except fp8_direct_cast wires fp8 while
     # the output (comb_out) stays bf16 (2 i32 per fp8 i32 unit). fp4: i32 = 8 fp4.
@@ -669,7 +673,25 @@ def make_combine(
             arith.constant(n_i32) + warps_per_tok - arith.constant(1)
         ) // warps_per_tok
         stage3_total = cur_rank_num_token * warps_per_tok
-        for stage3_idx in range(global_warp_id, stage3_total, global_warp_num):
+        if const_expr(combine_spread_group > 0):
+            # CU-group spread: fill the first ``G`` warps (one per SIMD of a WGP)
+            # of every block/CU before doubling up. Order = grp-major, then block,
+            # then warp-in-group:  CU0 w0..w(G-1), CU1 w0..w(G-1), …, then CU0
+            # w(G)..w(2G-1), …  (t = wg*(B*G) + bid*G + wl). Requires G | warp_num.
+            _G = fx.Int32(combine_spread_group)
+            wg = warp // _G
+            wl = warp % _G
+            work_origin = wg * fx.Int32(block_num * combine_spread_group) + (
+                bid * _G + wl
+            )
+        elif const_expr(combine_cu_spread):
+            # Block-major work order: round r uses block 0..B-1 on warp w before
+            # advancing w (t = bid + w*block_num + r*global_warp_num). Spreads
+            # early tokens across blocks/CUs (blk0 w0, blk1 w0, …) vs global id.
+            work_origin = bid + warp * fx.Int32(block_num)
+        else:
+            work_origin = global_warp_id
+        for stage3_idx in range(work_origin, stage3_total, global_warp_num):
             tok_id = stage3_idx // warps_per_tok
             part_id = stage3_idx % warps_per_tok
             unit_base = part_id * units_per_warp
@@ -858,6 +880,14 @@ def make_combine(
             block=[warp_num_per_block * WAVE, 1, 1],
             stream=stream,
         )
+
+    _hints = {}
+    if waves_per_eu:
+        _hints["waves_per_eu"] = waves_per_eu
+    if maxnreg:
+        _hints["maxnreg"] = maxnreg
+    if _hints:
+        run.compile_hints = {**getattr(run, "compile_hints", {}), **_hints}
 
     return run
 

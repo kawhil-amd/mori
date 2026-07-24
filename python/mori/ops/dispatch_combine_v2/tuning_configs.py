@@ -157,7 +157,7 @@ _GFX1250_SCHED_BF16 = (
     (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
     (1536, 192, 32, 96, 4),  # <=1536: comb block 96
     (4096, 192, 32, 128, 4),  # <=4096: comb block 128
-    (None, 192, 32, 128, 8),  # >4096:  comb warp 8 (242/273 GB/s @8192/16384)
+    (None, 192, 32, 192, 8),  # >4096:  comb 192/8 (unroll4: 16384 732 / 32768 880 GB/s)
 )
 _GFX1250_DEFAULT = dict(
     dispatch_block_num=192,

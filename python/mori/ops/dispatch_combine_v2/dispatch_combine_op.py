@@ -24,6 +24,7 @@
 One SymmArena window holds the symmetric staging; per-rank metadata are plain
 device tensors surfaced to the caller via from_gpu_ptr.
 """
+import os
 from dataclasses import dataclass
 
 import torch
@@ -41,6 +42,23 @@ from .intranode_kernels import (
 )
 
 _QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
+
+# Combine stage-2: block-major token assignment (spread work across blocks/CUs).
+_COMBINE_CU_SPREAD = os.environ.get("MORI_COMBINE_SPREAD_CU", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# CU-group spread: fill first G warps (one per SIMD) of every CU before doubling
+# up (0 = disabled; e.g. 4 on gfx1250 WGP with 4 SIMDs). Overrides block spread.
+_COMBINE_SPREAD_GROUP = int(os.environ.get("MORI_COMBINE_SPREAD_GROUP", "0"))
+# Combine occupancy hint: amdgpu-waves-per-eu (0 = compiler default).
+_COMBINE_WAVES_PER_EU = int(os.environ.get("MORI_COMBINE_WAVES_PER_EU", "0"))
+_COMBINE_MAXNREG = int(os.environ.get("MORI_COMBINE_MAXNREG", "0"))
+# Combine stage-2 per-lane load/accumulate unroll factor. Raised 2->4: more
+# in-flight vec4 loads hide xGMI latency better; ISA shows 179 VGPR, no spill
+# (gfx1250), and combine BW improves ~7-19% across tok sizes.
+_COMBINE_UNROLL = int(os.environ.get("MORI_COMBINE_UNROLL", "4"))
 
 _DT = {
     torch.bfloat16: 2,
@@ -618,6 +636,11 @@ class EpDispatchCombineOp:
                     off_out_wts=arena.offset("out_wts"),
                     reset_total_recv=True,
                     fp4=(cfg.combine_dtype == torch.float4_e2m1fn_x2),
+                    combine_cu_spread=_COMBINE_CU_SPREAD,
+                    combine_spread_group=_COMBINE_SPREAD_GROUP,
+                    waves_per_eu=_COMBINE_WAVES_PER_EU,
+                    maxnreg=_COMBINE_MAXNREG,
+                    _unroll=_COMBINE_UNROLL,
                 )
                 for (b, w) in combine_specs
             }

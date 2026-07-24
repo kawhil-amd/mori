@@ -53,6 +53,25 @@ sys.path.insert(
     0, os.path.join(_ROOT, "examples", "cco", "python")
 )  # cco_example_common
 from cco_example_common import set_device, sync  # noqa: E402
+
+# v2-only bench: avoid mori.ops __init__ eager import of legacy dispatch_combine
+# (pulls libmori_pybinds + system libprotobuf.so.32).
+import pathlib
+import types
+
+import mori as _mori_pkg
+
+if "mori.ops" not in sys.modules:
+    _ops = types.ModuleType("mori.ops")
+    _repo_ops = os.path.join(
+        os.environ.get("MORI_REPO", _ROOT), "python", "mori", "ops"
+    )
+    _wheel_ops = str(pathlib.Path(_mori_pkg.__file__).parent / "ops")
+    _ops.__path__ = (
+        [_repo_ops, _wheel_ops] if os.path.isdir(_repo_ops) else [_wheel_ops]
+    )
+    sys.modules["mori.ops"] = _ops
+
 from mori.ops.dispatch_combine_v2 import (  # noqa: E402
     EpDispatchCombineConfig,
     EpDispatchCombineOp,
