@@ -64,7 +64,7 @@ from flydsl.expr.rocdl import (
     cvt_scale_pk8_f32_fp4,
     cvt_scalef32_pk8_fp4_f32,
 )
-from flydsl.expr.typing import Int32, Int64
+from flydsl.expr.typing import Int32, Int64, Vector
 
 import mori.cco.device.flydsl as cco
 
@@ -814,6 +814,12 @@ def make_combine(
     # vec4 gather: 4 i32 per load (global_load_dwordx4) when output is 1:1.
     _use_vec4 = (n_i32 % 4 == 0) and not fp8_direct_cast
     out_step_mult = 2 if fp8_direct_cast else 1
+    # U-based unique-PE gather (vec4 only): keep the SAME static unroll budget as
+    # baseline (UNROLL = _unroll*topk vec4 loads/iter) but re-map those loads from
+    # "_unroll hidden x topk experts (incl. invalid)" to "U valid PEs x (UNROLL//U)
+    # hidden blocks (all valid)". Each output i32 unit reduces exactly U real
+    # contributions instead of topk, cutting load+reduce work ~ (topk-U)/topk.
+    _uniq = _os.environ.get("MORI_UNIQUE_GATHER", "0") == "1" and hidden_elem_size == 2
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_combine(
@@ -1047,6 +1053,145 @@ def make_combine(
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
 
+                def _accum_loop_uniq():
+                    # Total static vec4 loads/iter == baseline (_unroll x topk). We
+                    # spend them on U valid PEs x HB hidden blocks, HB = UNROLL//U.
+                    UNROLL = _unroll * experts_per_token
+                    one_i = arith.constant(1, type=T.i32())
+                    zero_i = arith.constant(0, type=T.i32())
+                    stepc = arith.constant(STEP_CHUNK, type=T.i32())
+                    # U = popcount(valid); vrank[k] = #valid in [0, k) (warp-uniform).
+                    vrank = []
+                    U = arith.constant(0, type=T.i32())
+                    for k in range_constexpr(experts_per_token):
+                        vrank.append(U)
+                        U = U + fx.Int32(
+                            arith.select(expert_valids[k], one_i, zero_i)
+                        )
+                    U = fx.Int32(arith.select(U < one_i, one_i, U))  # >=1, no div0
+                    # Local dummy base (own rank, tok 0): compact_base[p>=U] and any
+                    # redirect points here so surplus load slots hit local L2 (cheap)
+                    # instead of issuing a redundant remote (xGMI) read.
+                    local_dummy = fx.Int64(
+                        window.lsa_ptr(arith.constant(rank), off_out_tok)
+                    )
+                    # compact_base[p] = base of the p-th valid expert (valid->front),
+                    # via prefix-rank + select chain over the topk static SSA bases.
+                    compact_base = []
+                    for p in range_constexpr(experts_per_token):
+                        addr = local_dummy
+                        pc = arith.constant(p, type=T.i32())
+                        for k in range_constexpr(experts_per_token):
+                            take = arith.andi(expert_valids[k], vrank[k] == pc)
+                            addr = fx.Int64(
+                                arith.select(take, expert_bases[k], addr)
+                            )
+                        compact_base.append(addr)
+
+                    def _base_at(pe):  # dynamic pe -> compact_base[pe] (select chain)
+                        addr = compact_base[0]
+                        for p in range_constexpr(1, experts_per_token):
+                            addr = fx.Int64(
+                                arith.select(
+                                    pe == arith.constant(p, type=T.i32()),
+                                    compact_base[p],
+                                    addr,
+                                )
+                            )
+                        return addr
+
+                    hb = arith.constant(UNROLL, type=T.i32()) // U  # hidden blocks/iter
+                    valid_cnt = hb * U  # UNROLL - remainder (remainder < U -> never last)
+                    step = hb * stepc
+                    Um1 = U - one_i
+                    main_end = (eff // step) * step
+                    # Precompute the (slot_base, hl, ...) plan ONCE per token: pe/hl
+                    # stream through a serial select-chain, but it is loop-invariant so
+                    # the per-slot base address is hoisted out of the hidden loop and
+                    # the UNROLL loads stay mutually independent (no serial addr chain).
+                    pe = zero_i
+                    hl = zero_i
+                    plan = []
+                    for g in range_constexpr(UNROLL):
+                        valid_slot = arith.constant(g, type=T.i32()) < valid_cnt
+                        slot_base = _base_at(pe)
+                        safe_hl = fx.Int32(arith.select(valid_slot, hl, zero_i))
+                        is_first = pe == zero_i
+                        is_last = pe == Um1
+                        plan.append((slot_base, hl, safe_hl, is_first, is_last))
+                        pe1 = pe + one_i
+                        wrap = pe1 == U
+                        pe = fx.Int32(arith.select(wrap, zero_i, pe1))
+                        hl = fx.Int32(arith.select(wrap, hl + one_i, hl))
+                    for uu in range(lane * VEC, main_end, step):
+                        base = unit_base + uu
+                        # Pass 1: issue all UNROLL vec4 loads (independent addresses;
+                        # remainder slots redirect to hl=0 to stay in-bounds & cheap).
+                        vecs = []
+                        for g in range_constexpr(UNROLL):
+                            slot_base, _, safe_hl, _, _ = plan[g]
+                            vecs.append(
+                                P.load_v4i32_nt(slot_base, base + safe_hl * stepc)
+                            )
+                        # Pass 2: sum each hidden block's U PE contributions; acc resets
+                        # at pe==0 and stores at pe==U-1. All U slots of one block share
+                        # off, so exactly one store per hidden block.
+                        accj = [None] * VEC
+                        for g in range_constexpr(UNROLL):
+                            slot_base, hl_g, _, is_first, is_last = plan[g]
+                            # Reset at a block boundary (pe==0) without a per-lane
+                            # branch/select: keep=0 zeroes the carried acc, keep=1
+                            # keeps it, so acc*keep + contrib fuses to one v_pk_fma.
+                            keep = is_first.select(
+                                arith.constant(0.0, type=T.f32()),
+                                arith.constant(1.0, type=T.f32()),
+                            )
+                            for j in range_constexpr(VEC):
+                                contrib = _to_accum2(
+                                    vector.extract(vecs[g], static_position=[j])
+                                )
+                                if g == 0:
+                                    accj[j] = contrib
+                                else:
+                                    accj[j] = accj[j] * keep + contrib
+                            if is_last:
+                                off = base + hl_g * stepc
+                                for j in range_constexpr(VEC):
+                                    buffer_store(
+                                        _from_accum2(accj[j]),
+                                        rsrc_out,
+                                        out_base + off + j,
+                                    )
+                    # vec4 U-tail: full STEP_CHUNK blocks past the big-step main loop
+                    # (main's step=hb*STEP_CHUNK can leave a large remainder). hb=1
+                    # here: reduce over the compacted bases, masking p>=U to skip the
+                    # add. Keeps the tail on vec4 instead of the scalar topk _one path.
+                    v4_end = (eff // STEP_CHUNK) * STEP_CHUNK
+                    for uu in range(main_end + lane * VEC, v4_end, STEP_CHUNK):
+                        base = unit_base + uu
+                        tvecs = []
+                        for p in range_constexpr(experts_per_token):
+                            tvecs.append(P.load_v4i32_nt(compact_base[p], base))
+                        accj = [None] * VEC
+                        for p in range_constexpr(experts_per_token):
+                            validp = arith.constant(p, type=T.i32()) < U
+                            for j in range_constexpr(VEC):
+                                c = _to_accum2(
+                                    vector.extract(tvecs[p], static_position=[j])
+                                )
+                                if p == 0:
+                                    accj[j] = c
+                                else:
+                                    accj[j] = Vector(
+                                        arith.select(validp, accj[j] + c, accj[j])
+                                    )
+                        for j in range_constexpr(VEC):
+                            buffer_store(
+                                _from_accum2(accj[j]), rsrc_out, out_base + base + j
+                            )
+                    for uu in range(v4_end + lane, eff, WAVE):
+                        _one(unit_base + uu)
+
             else:
 
                 def _accum_loop():
@@ -1078,7 +1223,10 @@ def make_combine(
                     for u in range(main_end + lane, eff, WAVE):
                         _one(unit_base + u)
 
-            _accum_loop()
+            if const_expr(_uniq and _use_vec4):
+                _accum_loop_uniq()
+            else:
+                _accum_loop()
 
         # No exit barrier: the per-block monotonic flag needs no reset, and gather
         # does no post-completion work, so kernel retirement (stream-ordered) is
