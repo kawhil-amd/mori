@@ -25,7 +25,7 @@
 // Adaptive PULL-only combine body. Differs from EpCombine1250xBody in:
 //   1. XDB split: remote store fires before pre-scan; wait after
 //   2. Pre-scan atomicMax for dynamic chunk sizing (overlaps XGMI propagation)
-//   3. Work-stealing gather loop for natural load balancing
+//   3. Staggered-load + block-wide sequential reduce
 //   4. No QUAD path — PULL only
 //   5. Drops __threadfence_block() after s_wait_tensorcnt (same-wavefront LDS)
 
@@ -177,11 +177,6 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
   // Phase 3: Pre-scan max source count (overlaps XGMI propagation)
   //   Only computes block-wide max — no per-token storage.
   // ==================================================================
-  constexpr int kWarpsPerGroup = 4;
-  static_assert(kCfg.warpPerBlock % kWarpsPerGroup == 0);
-  const int _grpId = warpId / kWarpsPerGroup;
-  const int _inGrpId = warpId % kWarpsPerGroup;
-  const int _grpsPerBlock = warpNum / kWarpsPerGroup;
   const int _numTokens = (int)args.numTokens;
 
   if (thdId == 0) meta.adaptMaxSrc = 0;
@@ -191,7 +186,7 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
   for (int i = globalWarpId; i < _numTokens; i += globalWarpNum) {
     int nSrc = 0;
     for (int j = laneId; j < topk; j += WS) {
-      index_t destTokId = args.dispDestTokIdMap[tokenId * topk + j];
+      index_t destTokId = args.dispDestTokIdMap[i * topk + j];
       index_t destPe = EpPeFromFlat<kCfg>(destTokId);
       if (destPe < npes) nSrc++;
     }
@@ -208,7 +203,7 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
   if (args.numTokens == 0) return;
 
   // ==================================================================
-  // Dynamic tile sizing
+  // Dynamic tile sizing — per-warp budget
   // ==================================================================
   constexpr bool _cPullType = (sizeof(TokT) == 2 || sizeof(TokT) == 4);
   const int _cPullRowElems = 128 / (int)sizeof(TokT);
@@ -218,40 +213,51 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
   if (_dynSrcMax > _cPullSrcMaxStatic) _dynSrcMax = _cPullSrcMaxStatic;
   if (_dynSrcMax < 1) _dynSrcMax = 1;
 
-  const int _dimPerWarp = ((int)hiddenDim + kWarpsPerGroup - 1) / kWarpsPerGroup;
-  const size_t _perGroupBudget = _cAdaptTileBudget / (size_t)_grpsPerBlock;
-  const size_t _perWarpBudget = _perGroupBudget / kWarpsPerGroup;
+  const size_t _perWarpBudget = _cAdaptTileBudget / (size_t)warpNum;
   int _dynTileElems = (int)(_perWarpBudget / ((size_t)_dynSrcMax * sizeof(TokT)));
   _dynTileElems = (_dynTileElems / _cPullRowElems) * _cPullRowElems;
 
   const bool _dynPullOk =
-      _cPullType && (_dimPerWarp >= _cPullRowElems) && (_dynTileElems >= _cPullRowElems);
+      _cPullType && ((int)hiddenDim >= _cPullRowElems) && (_dynTileElems >= _cPullRowElems);
 
   TokT* _cPullTiles = nullptr;
   if constexpr (_cPullType) {
     _cPullTiles = reinterpret_cast<TokT*>(sharedMem) + (size_t)warpId * _dynSrcMax * _dynTileElems;
   }
 
+  // Per-warp nSrc broadcast in LDS tail (after _AdaptMeta)
+  int* _warpNSrcLds = reinterpret_cast<int*>(&meta + 1);
+
   // ==================================================================
-  // Warp-group gather + reduce
+  // Staggered-load + block-wide sequential reduce
   // ==================================================================
   const int _tokPerBlock = _numTokens / (int)gridDim.x;
   const int _tokRem = _numTokens % (int)gridDim.x;
   const int _tokStart = (int)blockIdx.x * _tokPerBlock + min((int)blockIdx.x, _tokRem);
   const int _tokCount = _tokPerBlock + ((int)blockIdx.x < _tokRem ? 1 : 0);
-  for (int _slot = _grpId; _slot < _tokCount; _slot += _grpsPerBlock) {
-    const int tokenId = _tokStart + _slot;
 
+  for (int _batchOff = 0; _batchOff < _tokCount; _batchOff += warpNum) {
+    const int _mySlot = _batchOff + warpId;
+    const bool _myValid = (_mySlot < _tokCount);
+    const int _myTokenId = _myValid ? (_tokStart + _mySlot) : 0;
+
+    // Each warp computes source pointers for its own token
     TokT* _srcPtrs[topk];
     [[maybe_unused]] float* _srcWtPtrs[topk];
+    int _myNSrc = 0;
     for (int j = 0; j < topk; ++j) {
-      index_t destTokId = args.dispDestTokIdMap[tokenId * topk + j];
-      index_t destPe = EpPeFromFlat<kCfg>(destTokId);
-      if (destPe < npes) {
-        index_t destLocalTokId = EpLocalTokFromFlat<kCfg>(destTokId);
-        _srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim;
-        if constexpr (kCfg.useWeights) {
-          _srcWtPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
+      if (_myValid) {
+        index_t destTokId = args.dispDestTokIdMap[_myTokenId * topk + j];
+        index_t destPe = EpPeFromFlat<kCfg>(destTokId);
+        if (destPe < npes) {
+          index_t destLocalTokId = EpLocalTokFromFlat<kCfg>(destTokId);
+          _srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim;
+          if constexpr (kCfg.useWeights)
+            _srcWtPtrs[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
+          ++_myNSrc;
+        } else {
+          _srcPtrs[j] = nullptr;
+          if constexpr (kCfg.useWeights) _srcWtPtrs[j] = nullptr;
         }
       } else {
         _srcPtrs[j] = nullptr;
@@ -259,54 +265,67 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
       }
     }
 
-    int validAccumCount = topk;
-    if (npes <= 4) {
-      int isValid = (laneId < topk && _srcPtrs[laneId] != nullptr) ? 1 : 0;
-      validAccumCount = __popcll(__ballot(isValid));
-    }
+    // Broadcast nSrc to all warps via LDS
+    if (laneId == 0) _warpNSrcLds[warpId] = _myValid ? _myNSrc : 0;
+    __syncthreads();
 
-    const size_t _dimOff = (size_t)_inGrpId * _dimPerWarp;
-    const size_t _dimSize =
-        (_dimOff < hiddenDim) ? min((size_t)_dimPerWarp, hiddenDim - _dimOff) : 0;
-    T* outPtr = (_dimSize > 0)
-                    ? (reinterpret_cast<T*>(args.outTokenBuf) + tokenId * hiddenDim + _dimOff)
-                    : nullptr;
+    // Per tile chunk
+    for (size_t _off = 0; _off < hiddenDim; _off += _dynTileElems) {
+      int _n = (int)(hiddenDim - _off);
+      if (_n > _dynTileElems) _n = _dynTileElems;
+      const bool _tdmOk = _dynPullOk && ((size_t)_n * sizeof(TokT) >= 128);
 
-    bool _pullDone = false;
-    if constexpr (_cPullType) {
-      if (_dynPullOk && (int)validAccumCount <= _dynSrcMax && _dimSize > 0) {
-        const int _nSrc = (int)validAccumCount;
-        const int _rowStride = _dynTileElems;
-
-        for (size_t _off = 0; _off < _dimSize; _off += _dynTileElems) {
-          int _n = (int)(_dimSize - _off);
-          if (_n > _dynTileElems) _n = _dynTileElems;
-
-          if ((size_t)_n * sizeof(TokT) < 128) {
-            for (int _e = laneId; _e < _n; _e += WS) {
-              float _acc = 0.0f;
-              for (int _j = 0; _j < topk; ++_j) {
-                if (_srcPtrs[_j] == nullptr) continue;
-                _acc += (float)(_srcPtrs[_j][_dimOff + _off + _e]);
-              }
-              outPtr[_off + _e] = T(_acc);
-            }
-            break;
-          }
-
+      // ---- Staggered TDM issue: warp 0..3 first ----
+      if constexpr (_cPullType) {
+        if (_tdmOk && _myValid && _myNSrc > 0) {
           const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
-          {
+          if (warpId < 4) {
             int _tileJ = 0;
             for (int _j = 0; _j < topk; ++_j) {
               if (_srcPtrs[_j] == nullptr) continue;
-              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_tileJ * _dynTileElems,
-                                 _srcPtrs[_j] + _dimOff + _off, _pg1);
+              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_tileJ * _dynTileElems, _srcPtrs[_j] + _off,
+                                 _pg1);
               ++_tileJ;
             }
           }
-          __builtin_amdgcn_s_wait_tensorcnt(0);
+        }
+      }
+      __syncthreads();
 
-          const int _nRed = _nSrc;
+      // ---- Warp 4..7 issue ----
+      if constexpr (_cPullType) {
+        if (_tdmOk && _myValid && _myNSrc > 0) {
+          const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
+          if (warpId >= 4) {
+            int _tileJ = 0;
+            for (int _j = 0; _j < topk; ++_j) {
+              if (_srcPtrs[_j] == nullptr) continue;
+              TdmIssueLoad<TokT>(_cPullTiles + (size_t)_tileJ * _dynTileElems, _srcPtrs[_j] + _off,
+                                 _pg1);
+              ++_tileJ;
+            }
+          }
+        }
+      }
+
+      // ---- Sequential reduce: one token at a time, all warps ----
+      for (int _w = 0; _w < warpNum; ++_w) {
+        if (_batchOff + _w >= _tokCount) break;
+        const int _wTokenId = _tokStart + _batchOff + _w;
+        const int _wNSrc = _warpNSrcLds[_w];
+
+        // Warp _w waits for its TDM loads
+        if (warpId == _w) __builtin_amdgcn_s_wait_tensorcnt(0);
+        __syncthreads();
+
+        T* _wOutPtr = reinterpret_cast<T*>(args.outTokenBuf) + (size_t)_wTokenId * hiddenDim + _off;
+
+        if (_tdmOk && _wNSrc > 0) {
+          TokT* _wTiles =
+              reinterpret_cast<TokT*>(sharedMem) + (size_t)_w * _dynSrcMax * _dynTileElems;
+          const int _nRed = _wNSrc;
+          const int _rowStride = _dynTileElems;
+
 #define _CROW_DEAD(_j) false
           constexpr int _cRedSrcMax = 4;
           constexpr int _cOutVB = 16;
@@ -314,8 +333,8 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
           constexpr int _cVB = _cV * (int)sizeof(TokT);
           using _CVecT = typename core::VecTypeSelector<_cVB>::dataType;
           using _COutVecT = typename core::VecTypeSelector<_cOutVB>::dataType;
-          const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) &&
-                               (((_dimOff + _off) % (size_t)_cV) == 0) && ((_rowStride % _cV) == 0);
+          const bool _cVecOk = ((hiddenDim % (size_t)_cV) == 0) && ((_off % (size_t)_cV) == 0) &&
+                               ((_rowStride % _cV) == 0);
           const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
           constexpr bool _cFoldMix =
               std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
@@ -335,7 +354,8 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
             }
           }
 
-          for (int _e = laneId * _cV; _e < _nv; _e += WS * _cV) {
+          // 8-warp interleaved vectorized reduce from warp _w's tiles
+          for (int _e = (warpId * WS + laneId) * _cV; _e < _nv; _e += warpNum * WS * _cV) {
             float _a[_cV];
 #pragma unroll
             for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
@@ -356,8 +376,7 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
               }
             };
 
-#define _CROW_AT(_j) \
-  (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
+#define _CROW_AT(_j) (*reinterpret_cast<const _CVecT*>(_wTiles + (size_t)(_j) * _rowStride + _e))
 
             if (_nRed <= _cRedSrcMax) {
               _CVecT _svR[_cRedSrcMax];
@@ -402,37 +421,38 @@ __device__ void EpCombine1250xAdaptBody(EpArgs args) {
             }
             static_assert(_cOutVB == 16, "the b128 store is written for the 16 B output vector");
             __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_ov),
-                                        reinterpret_cast<_mori_v4i*>(outPtr + _off + _e));
+                                        reinterpret_cast<_mori_v4i*>(_wOutPtr + _e));
           }
 
-          for (int _e = _nv + laneId; _e < _n; _e += WS) {
+          for (int _e = _nv + warpId * WS + laneId; _e < _n; _e += warpNum * WS) {
             float _acc = 0.0f;
             for (int _j = 0; _j < _nRed; ++_j) {
               if (_CROW_DEAD(_j)) continue;
-              _acc += (float)_cPullTiles[(size_t)_j * _rowStride + _e];
+              _acc += (float)_wTiles[(size_t)_j * _rowStride + _e];
             }
-            outPtr[_off + _e] = T(_acc);
+            _wOutPtr[_e] = T(_acc);
           }
 #undef _CROW_DEAD
+        } else if (_wNSrc > 0 && warpId == _w) {
+          // Scalar fallback — owning warp only
+          for (int _e = laneId; _e < _n; _e += WS) {
+            float _acc = 0.0f;
+            for (int _j = 0; _j < topk; ++_j) {
+              if (_srcPtrs[_j] == nullptr) continue;
+              _acc += (float)(_srcPtrs[_j][_off + _e]);
+            }
+            _wOutPtr[_e] = T(_acc);
+          }
         }
-        _pullDone = true;
+
+        __syncthreads();
       }
     }
 
-    if (!_pullDone && _dimSize > 0) {
-      for (size_t _e = laneId; _e < _dimSize; _e += WS) {
-        float _acc = 0.0f;
-        for (int _j = 0; _j < topk; ++_j) {
-          if (_srcPtrs[_j] == nullptr) continue;
-          _acc += (float)(_srcPtrs[_j][_dimOff + _e]);
-        }
-        outPtr[_e] = T(_acc);
-      }
-    }
-
+    // Weights — each warp handles its own token
     if constexpr (kCfg.useWeights) {
-      if (args.outWeightsBuf && _inGrpId == 0) {
-        core::WarpAccum<float, 4>(args.outWeightsBuf + tokenId * topk, _srcWtPtrs, nullptr, topk,
+      if (_myValid && args.outWeightsBuf) {
+        core::WarpAccum<float, 4>(args.outWeightsBuf + _myTokenId * topk, _srcWtPtrs, nullptr, topk,
                                   topk);
       }
     }
