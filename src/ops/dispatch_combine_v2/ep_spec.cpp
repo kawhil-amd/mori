@@ -143,7 +143,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
 std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const char* portableBody,
                            const char* gfx1250Body) {
   const bool is1250 = EpArchIs1250();
-  const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x.hpp"
+  const char* header = is1250 ? "src/ops/dispatch_combine_v2/ep_intranode_1250x_v2.hpp"
                               : "src/ops/dispatch_combine_v2/ep_intranode_kernel.hpp";
   const char* body = is1250 ? gfx1250Body : portableBody;
   // Scale staging is a macro rather than a Cfg read because the array is at file
@@ -194,7 +194,7 @@ std::string EpDispatchSpec::RenderSource(const Cfg& cfg) {
 }
 
 std::string EpCombineSpec::RenderSource(const Cfg& cfg) {
-  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xBody");
+  return RenderEpSource(cfg, EntryName(cfg), "EpCombineBody", "EpCombine1250xAdaptBody");
 }
 
 const std::vector<std::string>& EpDispatchSpec::SourceDeps() { return EpSourceDeps(); }
