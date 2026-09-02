@@ -58,7 +58,29 @@ namespace v2 {
 using index_t = int32_t;
 
 #define MORI_COMB_TDM 2
+// QUAD pipeline depth (LDS buffers per warp) and hidden-dim splits per token.
+//
+// What actually moves is BYTES IN FLIGHT = (bufs - 1) * tile, under two ceilings:
+// the LDS budget caps bufs * tile, and the hardware allows 10 outstanding tensor
+// ops. At hidden 7168 / EP4 / 8 warps those cross around chunks 4:
+//
+//     chunks  tile   max bufs        in flight   setup cost
+//       1     7168   2  (LDS)          14.0 KB      1x
+//       2     3584   5  (LDS)          28.0 KB      2x   <- saturates LDS
+//       4     1792  10  (tensorcnt)    31.5 KB      4x
+//       8      896  10  (tensorcnt)    15.75 KB     8x   <- worse than chunks 2
+//
+// Splitting further shrinks the tile without buying depth, so in-flight bytes fall
+// back off. The setup column is the cost: _qSetup re-reads dispDestTokIdMap and
+// rebuilds the pointer set once per chunk, on the critical path of the load issue.
+//
+// Defaults reproduce the pre-chunking shape. Override with -D to sweep.
+#ifndef MORI_COMB_QUAD
 #define MORI_COMB_QUAD 2
+#endif
+#ifndef MORI_COMB_QUAD_CHUNKS
+#define MORI_COMB_QUAD_CHUNKS 1
+#endif
 #define MORI_COMB_LDS_BUDGET 327680
 #define MORI_COMB_BARSLEEP 15
 #define MORI_COMB_BARSPREAD 16
@@ -833,8 +855,15 @@ __device__ void EpCombine1250xBody(EpArgs args) {
   bool _qDone = false;
   if constexpr (_cPullType && UseP2PRead) {
     constexpr int _qBufs = ((MORI_COMB_QUAD) < 2) ? 2 : (MORI_COMB_QUAD);
+    // A unit is a (token, hidden-chunk) pair rather than a whole token. The tile
+    // region is warpNum * _qBufs * (hiddenDim / _qChunks), so _qBufs and _qChunks
+    // trade against each other at CONSTANT LDS: at hidden 7168 / EP4 / 8 warps,
+    // (chunks 1, bufs 2), (2, 4) and (4, 8) all reserve the same 224 KB and differ
+    // only in pipeline depth. Chunking is what lifts the depth ceiling -- with the
+    // whole token as the unit, _qBufs 3 needs 336 KB and does not fit at all.
+    constexpr int _qChunks = ((MORI_COMB_QUAD_CHUNKS) < 1) ? 1 : (MORI_COMB_QUAD_CHUNKS);
     const int _qSize = npes;
-    const int _qTile = (int)hiddenDim;
+    const int _qTile = (int)hiddenDim / _qChunks;
     const int _qPart = (_qSize > 0) ? (_qTile / _qSize) : 0;
     constexpr int _qLdsPtrArrays = 1 + (kCfg.useWeights ? 1 : 0);
     const int _qLdsGroups = (_qSize > 0 && warpNum / _qSize > 0) ? (warpNum / _qSize) : 1;
@@ -842,12 +871,19 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         (((size_t)_qLdsPtrArrays * warpNum * topk * sizeof(void*)) + 127) & ~(size_t)127;
     _qLdsNeed += (size_t)warpNum * _qBufs * _qTile * sizeof(TokT);
     _qLdsNeed += (size_t)(warpNum + 2 * _qLdsGroups) * _qBufs * sizeof(int);
-    _qLdsNeed = (_qLdsNeed + 127) & ~(size_t)127;
-    _qLdsNeed += (size_t)warpNum * _qBufs * _qPart * sizeof(T);
+    // One pointer per (warp, buffer) for the local-rank source, which is carried
+    // as an address rather than staged through a tile.
+    _qLdsNeed = (_qLdsNeed + 15) & ~(size_t)15;
+    _qLdsNeed += (size_t)warpNum * _qBufs * sizeof(void*);
+    // No output staging region: the reduce writes its slice straight to global.
+    // Every warp owns a contiguous _qPart run, so those stores already coalesce,
+    // and the LDS round trip they replaced also cost a barrier and made the store
+    // issuer (lane group 0) wait deeper than everyone else, which the group-wide
+    // barrier then charged to the whole group.
     if (_cRedEnd > 0 && _qSize >= 2 && _cPullSrcMax == _qSize && (warpNum % _qSize) == 0 &&
-        mwIter.warpsPerItem == 1 && _qPart > 0 && (hiddenDim % (size_t)_qSize) == 0 &&
-        (_qPart % (16 / (int)sizeof(T))) == 0 && _qTile >= _cPullRowElems &&
-        _qLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET) {
+        mwIter.warpsPerItem == 1 && _qPart > 0 && (hiddenDim % (size_t)_qChunks) == 0 &&
+        ((size_t)_qTile % (size_t)_qSize) == 0 && (_qPart % (16 / (int)sizeof(T))) == 0 &&
+        _qTile >= _cPullRowElems && _qLdsNeed <= (size_t)MORI_COMB_LDS_BUDGET) {
       const int _qPerBlk = warpNum / _qSize;
       const int _qId = warpId / _qSize;
       const int _qLane = warpId % _qSize;
@@ -855,6 +891,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       const int _qCount = (int)gridDim.x * _qPerBlk;
       const int _qN = (int)args.numTokens;
       const int _qIter = (_qN + _qCount - 1) / _qCount;
+      // Units advance chunk-fastest so consecutive units stay inside one token:
+      // the setup (dispDestTokIdMap read, pointer build, ballot compaction) then
+      // repeats per chunk on the same token, which is what lets the source pointer
+      // be re-derived cheaply instead of ringed across token boundaries.
+      const int _qUnitsAll = _qIter * _qChunks;
       constexpr int _qPtrArrays = 1 + (kCfg.useWeights ? 1 : 0);
       const size_t _qBaseOff =
           (((size_t)_qPtrArrays * warpNum * topk * sizeof(void*)) + 127) & ~(size_t)127;
@@ -864,44 +905,73 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       const gfx1250_TDM_GROUP1 _qPgFull = TdmShape<TokT>(_qTile);
       const gfx1250_TDM_GROUP1 _qPgDummy = TdmShape<TokT>(_cPullRowElems);
       TokT* const _qSafe = EpPeer<TokT>(win, myPe, args.offOutTok);
-      auto _qSetup = [&](int _tok, int& _cntOut) -> TokT* {
+      // Sources split by locality. A peer copy has to cross XGMI, so it keeps the
+      // TDM path -- one warp per remote source, staged into LDS. The copy that
+      // landed on this rank is already in local HBM: routing it through TDM buys
+      // nothing and costs a tile plus a tensorcnt slot, so it comes back as a raw
+      // address and the reduce reads it with an ordinary VMEM load, on a pipe the
+      // tensor loads are not using.
+      // Called once per (token, chunk) rather than once per token, so anything
+      // whole-token here is gated on _wt -- see the weights accumulation below.
+      auto _qSetup = [&](int _tok, bool _wt, int& _cntOut, TokT*& _locOut) -> TokT* {
         if (_tok >= _qN) {
           _cntOut = 0;
+          _locOut = nullptr;
           return nullptr;
         }
+        TokT* _myPtr = nullptr;
+        int _myLocal = 0;
         for (int _j = laneId; _j < topk; _j += WS) {
           index_t _dt = args.dispDestTokIdMap[(size_t)_tok * topk + _j];
           index_t _dp = EpPeFromFlat<kCfg>(_dt);
+          TokT* _p = nullptr;
           if (_dp < npes) {
             index_t _dl = EpLocalTokFromFlat<kCfg>(_dt);
-            srcPtrs[_j] = EpPeer<TokT>(win, _dp, args.offOutTok) + (size_t)_dl * hiddenDim;
+            _p = EpPeer<TokT>(win, _dp, args.offOutTok) + (size_t)_dl * hiddenDim;
             if constexpr (kCfg.useWeights) {
               srcWeightsPtr[_j] = EpPeer<float>(win, _dp, args.offOutWts) + (size_t)_dl * topk;
             }
           } else {
-            srcPtrs[_j] = nullptr;
             if constexpr (kCfg.useWeights) srcWeightsPtr[_j] = nullptr;
           }
+          if (_j == laneId) {
+            _myPtr = _p;
+            _myLocal = (_p != nullptr && (int)_dp == myPe) ? 1 : 0;
+          }
         }
-        int _isValid = 0;
-        TokT* _myPtr = nullptr;
-        if (laneId < topk) {
-          _myPtr = srcPtrs[laneId];
-          _isValid = (_myPtr != nullptr) ? 1 : 0;
-        }
-        unsigned long long _mask = __ballot(_isValid);
-        const int _cnt = __popcll(_mask);
-        if (_cnt < topk && _isValid) {
-          const int _slot = __popcll(_mask & ((1ULL << laneId) - 1));
+        const int _isValid = (laneId < topk && _myPtr != nullptr) ? 1 : 0;
+        const int _isRem = _isValid & (_myLocal ^ 1);
+        const unsigned long long _rmask = __ballot(_isRem);
+        const int _cnt = __popcll(_rmask);
+        if (_isRem) {
+          const int _slot = __popcll(_rmask & ((1ULL << laneId) - 1));
           srcPtrs[_slot] = _myPtr;
         }
+        // At most one source can be local: dispatch keeps a single entry per
+        // destination peer, so the duplicates are already EpNullFlat here. Take the
+        // first set lane anyway and hand the address over in registers rather than
+        // through srcPtrs, whose front is now the compacted remote run.
+        const unsigned long long _lmask = __ballot(_isValid & _myLocal);
+        TokT* _loc = nullptr;
+        if (_lmask) {
+          const int _ll = __ffsll((long long)_lmask) - 1;
+          const uintptr_t _pv = (uintptr_t)_myPtr;
+          const int _plo = __shfl((int)(uint32_t)_pv, _ll);
+          const int _phi = __shfl((int)(uint32_t)(_pv >> 32), _ll);
+          _loc = reinterpret_cast<TokT*>(((uintptr_t)(uint32_t)_phi << 32) |
+                                         (uintptr_t)(uint32_t)_plo);
+        }
         if constexpr (kCfg.useWeights) {
-          if (args.outWeightsBuf != nullptr && _qLane == 0) {
+          // Whole-token work, so only the first chunk of a token does it. WarpAccum
+          // overwrites rather than accumulates, so repeating it per chunk would be
+          // harmless but is pure waste.
+          if (args.outWeightsBuf != nullptr && _qLane == 0 && _wt) {
             core::WarpAccum<float, 4>(args.outWeightsBuf + (size_t)_tok * topk, srcWeightsPtr,
                                       nullptr, topk, topk);
           }
         }
         _cntOut = _cnt;
+        _locOut = _loc;
         return (_qLane < _cnt) ? srcPtrs[_qLane] : nullptr;
       };
       auto _qIssue = [&](TokT* _dst, TokT* _src) {
@@ -910,35 +980,34 @@ __device__ void EpCombine1250xBody(EpArgs args) {
         else
           TdmIssueLoad<TokT>(_dst, _qSafe, _qPgDummy);
       };
-      const int _qUnits = _qIter;
+      const int _qUnits = _qUnitsAll;
       int* const _qLdsAux = reinterpret_cast<int*>(_qTiles + (size_t)warpNum * _qBufs * _qTile);
       int* const _qCntRing = _qLdsAux + warpId * _qBufs;
-      TokT* const _qOut = reinterpret_cast<TokT*>(
-          (reinterpret_cast<uintptr_t>(_qLdsAux + (warpNum + 2 * _qPerBlk) * _qBufs) + 127) &
-          ~(uintptr_t)127);
-      T* const _qOutBase = reinterpret_cast<T*>(_qOut);
-      const size_t _qOutGrp = (size_t)_qId * _qBufs * _qTile;
-      T* const _qOutMine = _qOutBase + _qOutGrp + (size_t)_qLane * _qPart;
-      const size_t _qOutStride = (size_t)_qTile;
-      const gfx1250_TDM_GROUP1 _qPgOut = TdmShape<T>(_qTile);
-      constexpr int _qTstOps = _qBufs - 1;
+      // Local-source address per pipeline slot. It rides the same ring as the
+      // remote count so the reduce, which runs a token behind the setup, still
+      // knows which token's local copy it is looking at. The address is already
+      // chunk-offset, so the reduce needs no chunk arithmetic of its own.
+      TokT** const _qLocAll = reinterpret_cast<TokT**>(
+          (reinterpret_cast<uintptr_t>(_qLdsAux + (warpNum + 2 * _qPerBlk) * _qBufs) + 15) &
+          ~(uintptr_t)15);
+      TokT** const _qLocRing = _qLocAll + (size_t)warpId * _qBufs;
+      // Only loads are in flight now that the reduce stores straight to global, so
+      // every warp waits on the same depth -- the store issuer's deeper wait is
+      // gone, and with it the group-wide stall the next barrier turned it into.
       constexpr int _qWaitLd = _qBufs - 1;
-      constexpr int _qWaitSt = (_qBufs - 1) + _qTstOps;
-      const bool _qStIssuer = (_qLane == 0);
       int _qPreCnt = 0;
       TokT* _qPre = nullptr;
-      auto _qUnitTok = [&](int _u) { return _qGroup + _u * _qCount; };
-      auto _qShipPrev = [&](int _up) -> bool {
-        const int _tp = _qUnitTok(_up);
-        if (_qLane != 0 || _tp >= _qN) return false;
-        TdmIssueStore<T>(reinterpret_cast<T*>(args.outTokenBuf) + (size_t)_tp * hiddenDim,
-                         _qOutBase + _qOutGrp + (size_t)(_up % _qBufs) * _qTile, _qPgOut);
-        return true;
-      };
+      TokT* _qPreLoc = nullptr;
+      auto _qUnitTok = [&](int _u) { return _qGroup + (_u / _qChunks) * _qCount; };
+      auto _qUnitChunk = [&](int _u) { return _u - (_u / _qChunks) * _qChunks; };
       auto _qLaunch = [&](int _u) -> bool {
-        _qPre = _qSetup(_qUnitTok(_u), _qPreCnt);
+        const int _ch = _qUnitChunk(_u);
+        const size_t _co = (size_t)_ch * (size_t)_qTile;
+        _qPre = _qSetup(_qUnitTok(_u), _ch == 0, _qPreCnt, _qPreLoc);
         _qCntRing[_u % _qBufs] = _qPreCnt;
-        _qIssue(_qMine + (size_t)(_u % _qBufs) * _qTile, _qPre);
+        _qLocRing[_u % _qBufs] = (_qPreLoc != nullptr) ? (_qPreLoc + _co) : nullptr;
+        _qIssue(_qMine + (size_t)(_u % _qBufs) * _qTile,
+                (_qPre != nullptr) ? (_qPre + _co) : nullptr);
         return true;
       };
       constexpr int _qOutVB = 16;
@@ -949,22 +1018,28 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       constexpr bool _qCvtPk =
           std::is_same_v<TokT, hip_bfloat16> && std::is_same_v<T, hip_bfloat16>;
       const int _qnv = (_qPart / _qV) * _qV;
+      // Prologue, clamped to _qUnits. A short group needs NO depth adaptation: with
+      // _qUnits <= _qBufs the clamp issues every unit here and the main loop then
+      // takes the no-launch arm every time, draining wait(_qUnits-1) down to
+      // wait(0) -- issue-everything-then-consume, which is the most in flight the
+      // LDS allows. Capping _qBufs when _qIter is small would only undo that, so
+      // the depth is left alone; only _qUnits == 1 has nothing to overlap, and
+      // chunking already lifts that case to _qUnits == _qChunks.
       for (int _k = 0; _k < _qBufs - 1 && _k < _qUnits; ++_k) _qLaunch(_k);
       for (int _u = 0; _u < _qUnits; ++_u) {
         const int _tok = _qUnitTok(_u);
         const int _buf = _u % _qBufs;
         const int _cntCur = _qCntRing[_buf];
+        TokT* const _locCur = _qLocRing[_buf];
         _Q_BARRIER();
-        if (_u > 0) _qShipPrev(_u - 1);
         const int _uN = _u + _qBufs - 1;
         if (_uN < _qUnits) {
           _qLaunch(_uN);
-          if (_qStIssuer)
-            __builtin_amdgcn_s_wait_tensorcnt(_qWaitSt);
-          else
-            __builtin_amdgcn_s_wait_tensorcnt(_qWaitLd);
+          __builtin_amdgcn_s_wait_tensorcnt(_qWaitLd);
         } else {
-          switch ((_qUnits - 1 - _u) + (_qStIssuer ? _qTstOps : 0)) {
+          // Drain: only the loads still in flight for units after this one. The
+          // operand must be an immediate, and the count never exceeds _qBufs-1.
+          switch (_qUnits - 1 - _u) {
             case 1:
               __builtin_amdgcn_s_wait_tensorcnt(1);
               break;
@@ -998,30 +1073,43 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           }
         }
         _Q_BARRIER();
-        const bool _qOutTdm = (_tok < _qN);
-        if (_qOutTdm && _cntCur <= 0) {
-          for (int _e = laneId; _e < _qPart; _e += WS)
-            (_qOutMine + (size_t)_buf * _qOutStride)[_e] = T(0.0f);
+        // This warp's slice of this unit's chunk, in the output token. Both the
+        // chunk offset and the intra-chunk lane offset are folded in here, so the
+        // reduce below indexes it exactly the way it used to index the LDS slab.
+        const size_t _o = (size_t)_qLane * (size_t)_qPart;
+        T* const _outG = reinterpret_cast<T*>(args.outTokenBuf) + (size_t)_tok * hiddenDim +
+                         (size_t)_qUnitChunk(_u) * (size_t)_qTile + _o;
+        if (_tok < _qN && _cntCur <= 0 && _locCur == nullptr) {
+          for (int _e = laneId; _e < _qPart; _e += WS) _outG[_e] = T(0.0f);
         }
-        if (_tok < _qN && _cntCur > 0) {
+        if (_tok < _qN && (_cntCur > 0 || _locCur != nullptr)) {
           const int _cntRed = _cntCur;
-          const size_t _o = (size_t)_qLane * (size_t)_qPart;
-          T* const _outLds = _qOutMine + (size_t)_buf * _qOutStride;
           const TokT* const _tBase = _qGroupBase + (size_t)_buf * _qTile + _o;
           const size_t _tStride = (size_t)_qBufs * _qTile;
+          // This warp's slice of the local copy. _qPart is a multiple of the 16 B
+          // vector (checked in the path guard) so the slice base stays aligned.
+          const bool _qLocal = (_locCur != nullptr);
+          const TokT* const _lBase = _qLocal ? (_locCur + _o) : _tBase;
+          // Straight to global, and nontemporal for the same reason the PULL path
+          // is: the combine output is not read again by this kernel.
+          static_assert(_qOutVB == 16, "the b128 store is written for the 16 B output vector");
           auto _qStore = [&](int _e, _QOutVecT _v) {
-            *reinterpret_cast<_QOutVecT*>(_outLds + _e) = _v;
+            __builtin_nontemporal_store(*reinterpret_cast<const _mori_v4i*>(&_v),
+                                        reinterpret_cast<_mori_v4i*>(_outG + _e));
           };
-          if (_cntRed == 4) {
+          // Four sources is the shape the four-wide unroll was written for; with
+          // the local copy split out it is now three LDS rows plus the HBM one.
+          if (_cntRed + (_qLocal ? 1 : 0) == 4) {
             const TokT* _p0 = _tBase;
             const TokT* _p1 = _tBase + _tStride;
             const TokT* _p2 = _tBase + 2 * _tStride;
-            const TokT* _p3 = _tBase + 3 * _tStride;
+            const TokT* _p3 = _qLocal ? _tBase : (_tBase + 3 * _tStride);
             for (int _e = laneId * _qV; _e < _qnv; _e += WS * _qV) {
               const _QVecT _v0 = *reinterpret_cast<const _QVecT*>(_p0 + _e);
               const _QVecT _v1 = *reinterpret_cast<const _QVecT*>(_p1 + _e);
               const _QVecT _v2 = *reinterpret_cast<const _QVecT*>(_p2 + _e);
-              const _QVecT _v3 = *reinterpret_cast<const _QVecT*>(_p3 + _e);
+              const _QVecT _v3 = _qLocal ? *reinterpret_cast<const _QVecT*>(_lBase + _e)
+                                         : *reinterpret_cast<const _QVecT*>(_p3 + _e);
               float _qAcc[_qV];
               union {
                 _QOutVecT _ov;
@@ -1050,8 +1138,17 @@ __device__ void EpCombine1250xBody(EpArgs args) {
           } else {
             for (int _e = laneId * _qV; _e < _qnv; _e += WS * _qV) {
               float _a[_qV];
+              // Prime from the local copy instead of zero: the VMEM load issues
+              // alongside the LDS reads below and saves an add per element.
+              if (_qLocal) {
+                const _QVecT _lv = *reinterpret_cast<const _QVecT*>(_lBase + _e);
 #pragma unroll
-              for (int _k = 0; _k < _qV; ++_k) _a[_k] = 0.0f;
+                for (int _k = 0; _k < _qV; ++_k)
+                  _a[_k] = (float)(reinterpret_cast<const TokT*>(&_lv)[_k]);
+              } else {
+#pragma unroll
+                for (int _k = 0; _k < _qV; ++_k) _a[_k] = 0.0f;
+              }
               for (int _j = 0; _j < _cntRed; ++_j) {
                 _QVecT _sv =
                     *reinterpret_cast<const _QVecT*>(_tBase + (size_t)_j * _tStride + (size_t)_e);
@@ -1076,19 +1173,16 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             }
           }
           for (int _e = _qnv + laneId; _e < _qPart; _e += WS) {
-            float _acc = 0.0f;
+            float _acc = _qLocal ? (float)(_lBase[_e]) : 0.0f;
             for (int _j = 0; _j < _cntRed; ++_j)
               _acc += (float)(_qGroupBase[((size_t)_j * _qBufs + (size_t)_buf) * _qTile + _o +
                                           (size_t)_e]);
-            _outLds[_e] = T(_acc);
+            _outG[_e] = T(_acc);
           }
         }
       }
-      if (_qUnits > 0) {
-        _Q_BARRIER();
-        _qShipPrev(_qUnits - 1);
-      }
-      __builtin_amdgcn_s_wait_tensorcnt(0);
+      // The reduce stores to global directly, so nothing is left staged and there
+      // is no trailing ship. The loads are all consumed by the drain above.
       __syncthreads();
       _qDone = true;
     }
@@ -1100,54 +1194,60 @@ __device__ void EpCombine1250xBody(EpArgs args) {
       size_t hiddenDimOffset, hiddenDimSize;
       mwIter.Decode(i, tokenId, inTokenPartId, hiddenDimOffset, hiddenDimSize);
 
+      TokT* myTokPtr = nullptr;
+      int myIsLocal = 0;
       for (int j = laneId; j < topk; j += WS) {
         index_t destTokId = args.dispDestTokIdMap[tokenId * topk + j];
         index_t destPe = EpPeFromFlat<kCfg>(destTokId);
+        TokT* p = nullptr;
         if (destPe < npes) {
           index_t destLocalTokId = EpLocalTokFromFlat<kCfg>(destTokId);
-          srcPtrs[j] = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim +
-                       hiddenDimOffset;
+          p = EpPeer<TokT>(win, destPe, args.offOutTok) + destLocalTokId * hiddenDim +
+              hiddenDimOffset;
           if constexpr (kCfg.useWeights) {
             srcWeightsPtr[j] = EpPeer<float>(win, destPe, args.offOutWts) + destLocalTokId * topk;
           }
         } else {
-          srcPtrs[j] = nullptr;
           if constexpr (kCfg.useWeights) srcWeightsPtr[j] = nullptr;
+        }
+        if (j == laneId) {
+          myTokPtr = p;
+          myIsLocal = (p != nullptr && (int)destPe == myPe) ? 1 : 0;
         }
       }
 
       T* outPtr = reinterpret_cast<T*>(args.outTokenBuf) + tokenId * hiddenDim + hiddenDimOffset;
 
-      int validAccumCount = topk;
-      if (npes <= 4) {
-        int isValid = 0;
-        TokT* myTokPtr = nullptr;
-        if (laneId < topk) {
-          myTokPtr = srcPtrs[laneId];
-          isValid = (myTokPtr != nullptr) ? 1 : 0;
-        }
-        unsigned long long validMask = __ballot(isValid);
-        validAccumCount = __popcll(validMask);
-        if (validAccumCount < topk && isValid) {
-          int myPos = __popcll(validMask & ((1ULL << laneId) - 1));
-          srcPtrs[myPos] = myTokPtr;
-        }
-      }
+      // Compact remote sources to the front and park the local one -- there is at
+      // most one, dispatch dedups per destination peer -- in the slot right after
+      // them. Only the remote run goes through TDM; the local copy is read from
+      // HBM during the reduce, which keeps a tile and a tensorcnt slot free and
+      // lets the two loads overlap. The layout is still a dense run of
+      // validAccumCount live pointers, so the WarpAccumLF fallback below is
+      // unaffected (and now never sees a hole).
+      const int _cValid = (laneId < topk && myTokPtr != nullptr) ? 1 : 0;
+      const int _cRemMine = _cValid & (myIsLocal ^ 1);
+      const unsigned long long _cRmask = __ballot(_cRemMine);
+      const int _nRemote = __popcll(_cRmask);
+      const unsigned long long _cLmask = __ballot(_cValid & myIsLocal);
+      const int validAccumCount = _nRemote + ((_cLmask != 0ull) ? 1 : 0);
+      if (_cRemMine) srcPtrs[__popcll(_cRmask & ((1ULL << laneId) - 1))] = myTokPtr;
+      if (_cLmask != 0ull && laneId == (__ffsll((long long)_cLmask) - 1))
+        srcPtrs[_nRemote] = myTokPtr;
+      for (int j = validAccumCount + laneId; j < topk; j += WS) srcPtrs[j] = nullptr;
 
       bool _pullDone = false;
       if constexpr (_cPullType) {
         if (_cPullOk && (int)validAccumCount <= _cPullSrcMax) {
-          const int _nSrc = (int)validAccumCount;
+          const int _nSrc = _nRemote;
+          TokT* const _locSrc = (_cLmask != 0ull) ? srcPtrs[_nRemote] : nullptr;
           for (size_t _off = 0; _off < hiddenDimSize; _off += _cPullTileElems) {
             int _n = (int)(hiddenDimSize - _off);
             if (_n > _cPullTileElems) _n = _cPullTileElems;
             if ((size_t)_n * sizeof(TokT) < 128) {
               for (int _e = laneId; _e < _n; _e += WS) {
-                float _acc = 0.0f;
-                for (int _j = 0; _j < _nSrc; ++_j) {
-                  if (srcPtrs[_j] == nullptr) continue;
-                  _acc += (float)(srcPtrs[_j][_off + _e]);
-                }
+                float _acc = (_locSrc != nullptr) ? (float)(_locSrc[_off + _e]) : 0.0f;
+                for (int _j = 0; _j < _nSrc; ++_j) _acc += (float)(srcPtrs[_j][_off + _e]);
                 outPtr[_off + _e] = T(_acc);
               }
               break;
@@ -1155,15 +1255,19 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             const int _rowCnt = _nSrc;
             const int _rowStride = _cPullTileElems;
             const gfx1250_TDM_GROUP1 _pg1 = TdmShape<TokT>(_n);
-            for (int _j = 0; _j < _nSrc; ++_j) {
-              if (srcPtrs[_j] == nullptr) continue;
+            for (int _j = 0; _j < _nSrc; ++_j)
               TdmIssueLoad<TokT>(_cPullTiles + (size_t)_j * _cPullTileElems, srcPtrs[_j] + _off,
                                  _pg1);
-            }
+            // No __threadfence_block() here: the TDM loads land in this warp's own
+            // LDS rows and are read by this same wavefront, so s_wait_tensorcnt
+            // already orders them. A block-scope fence would only order against
+            // other waves, which never touch these rows.
             __builtin_amdgcn_s_wait_tensorcnt(0);
             const int _nRed = _rowCnt;
-#define _CROW_DEAD(_j) (srcPtrs[_j] == nullptr)
-            __threadfence_block();
+            // Rows [0, _nRemote) are the COMPACTED remote run -- the ballot above
+            // packs them without holes -- and _nRed never exceeds it, so a row is
+            // never dead here. The zero-multiplier fold below exists only to cover
+            // holes; with none possible it degenerates to a plain sum.
             constexpr int _cRedSrcMax = 4;
             constexpr int _cOutVB = 16;
             constexpr int _cV = _cOutVB / (int)sizeof(T);
@@ -1176,24 +1280,36 @@ __device__ void EpCombine1250xBody(EpArgs args) {
             const int _nv = _cVecOk ? (_n / (WS * _cV)) * (WS * _cV) : 0;
             constexpr bool _cFoldMix =
                 std::is_same_v<TokT, hip_bfloat16> && ((_cV % 2) == 0) && (_cVB == _cV * 2);
+            // Rows beyond _nRed are padding for the fixed four-wide unroll: they
+            // re-read row 0 (always live) and fold with a zero multiplier, so the
+            // unroll stays branch-free without reading uninitialised LDS.
             [[maybe_unused]] int _zRow[_cRedSrcMax];
             [[maybe_unused]] float _zMul[_cRedSrcMax];
             if constexpr (_cFoldMix) {
-              int _z0 = 0;
-#pragma unroll
-              for (int _j = _cRedSrcMax - 1; _j >= 0; --_j)
-                if (_j < _nRed && !_CROW_DEAD(_j)) _z0 = _j;
 #pragma unroll
               for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                const bool _live = (_j < _nRed) && !_CROW_DEAD(_j);
-                _zRow[_j] = _live ? _j : _z0;
+                const bool _live = (_j < _nRed);
+                _zRow[_j] = _live ? _j : 0;
                 _zMul[_j] = _live ? 1.0f : 0.0f;
               }
             }
+            // This chunk of the local copy, if the token has one. Same alignment
+            // argument as the tiles: _off steps by _cPullTileElems and _cVecOk
+            // already vets hiddenDim/hiddenDimOffset against the vector width.
+            const TokT* const _locVec = (_locSrc != nullptr) ? (_locSrc + _off) : nullptr;
             for (int _e = laneId * _cV; _e < _nv; _e += WS * _cV) {
               float _a[_cV];
+              // Priming from the local copy replaces the zero-init: the VMEM load
+              // runs against the TDM tiles' LDS reads rather than after them.
+              if (_locVec != nullptr) {
+                const _CVecT _lv = *reinterpret_cast<const _CVecT*>(_locVec + _e);
 #pragma unroll
-              for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
+                for (int _k = 0; _k < _cV; ++_k)
+                  _a[_k] = (float)(reinterpret_cast<const TokT*>(&_lv)[_k]);
+              } else {
+#pragma unroll
+                for (int _k = 0; _k < _cV; ++_k) _a[_k] = 0.0f;
+              }
               auto _cFoldRow = [&](int _j, const _CVecT& _sv, float _cMul) {
                 if constexpr (_cFoldMix) {
                   const uint32_t* _sd = reinterpret_cast<const uint32_t*>(&_sv);
@@ -1211,7 +1327,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
               };
 #define _CROW_AT(_j) \
   (*reinterpret_cast<const _CVecT*>(_cPullTiles + (size_t)(_j) * _rowStride + _e))
-              if (_nRed <= _cRedSrcMax) {
+              if (_nRed == 0) {
+                // Local-only token: no tile was loaded, so the zero-multiplier
+                // trick below would fold uninitialised LDS. The primed
+                // accumulator is already the answer.
+              } else if (_nRed <= _cRedSrcMax) {
                 _CVecT _svR[_cRedSrcMax];
                 if constexpr (_cFoldMix) {
 #pragma unroll
@@ -1225,15 +1345,12 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                   }
 #pragma unroll
                   for (int _j = 0; _j < _cRedSrcMax; ++_j) {
-                    if (_j >= _nRed || _CROW_DEAD(_j)) continue;
+                    if (_j >= _nRed) continue;
                     _cFoldRow(_j, _svR[_j], 1.0f);
                   }
                 }
               } else {
-                for (int _j = 0; _j < _nRed; ++_j) {
-                  if (_CROW_DEAD(_j)) continue;
-                  _cFoldRow(_j, _CROW_AT(_j), 1.0f);
-                }
+                for (int _j = 0; _j < _nRed; ++_j) _cFoldRow(_j, _CROW_AT(_j), 1.0f);
               }
 #undef _CROW_AT
               union {
@@ -1256,14 +1373,11 @@ __device__ void EpCombine1250xBody(EpArgs args) {
                                           reinterpret_cast<_mori_v4i*>(outPtr + _off + _e));
             }
             for (int _e = _nv + laneId; _e < _n; _e += WS) {
-              float _acc = 0.0f;
-              for (int _j = 0; _j < _nRed; ++_j) {
-                if (_CROW_DEAD(_j)) continue;
+              float _acc = (_locSrc != nullptr) ? (float)(_locSrc[_off + _e]) : 0.0f;
+              for (int _j = 0; _j < _nRed; ++_j)
                 _acc += (float)_cPullTiles[(size_t)_j * _rowStride + _e];
-              }
               outPtr[_off + _e] = T(_acc);
             }
-#undef _CROW_DEAD
           }
           _pullDone = true;
         }
