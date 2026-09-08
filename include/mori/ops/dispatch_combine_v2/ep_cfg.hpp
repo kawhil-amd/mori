@@ -141,6 +141,12 @@ struct EpArgs {
   int* combineBarrierFan =
       nullptr;  // [blockNum*16] gfx1250 combine intra-grid fan-out (local scratch)
 
+  // Pack+SDMA dispatch path: multi-peer tokens pack payload locally, leader SDMA-puts.
+  unsigned long long offPackBuf = 0;     // T[worldSize * maxRecv * hidden] local pack staging
+  unsigned long long offPackTokOff = 0;  // index_t[worldSize] per-peer pack slot counter
+  int* sdmaPackSlotMap = nullptr;        // [worldSize * maxPackPerPeer] packSlot -> destSlot
+  void* devComm = nullptr;               // ccoDevComm_t, passed opaquely (cco.hpp is HIP-only)
+
   int numTokens = 0;  // tokens this rank contributes this call
 };
 
@@ -173,6 +179,10 @@ struct EpArgs {
   X(gridBarrier, "p")          \
   X(xdbFlag, "p")              \
   X(combineBarrierFan, "p")    \
+  X(offPackBuf, "u64")         \
+  X(offPackTokOff, "u64")      \
+  X(sdmaPackSlotMap, "p")      \
+  X(devComm, "p")              \
   X(numTokens, "i32")
 
 #define MORI_EP_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
@@ -196,7 +206,7 @@ constexpr bool EpArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpArgsFieldCount == 24,
+static_assert(detail::kEpArgsFieldCount == 28,
               "added an EpArgs field -- add it to MORI_EP_ARGS_FIELDS in the same position "
               "and bump this count");
 static_assert(detail::EpArgsOffsetsAscend(),

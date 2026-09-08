@@ -144,7 +144,7 @@ struct EpMultiWarpIter {
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
 template <EpCfg kCfg, typename T>
-__device__ void EpDispatchBody(EpArgs args) {
+__device__ void EpDispatchBody(EpArgs args, cco::ccoDevComm_t /*devComm*/ = nullptr) {
   constexpr int kNpes = kCfg.worldSize;
   const int myPe = args.rank;
   constexpr int kTopk = kCfg.numExpertPerToken;
@@ -341,7 +341,7 @@ __device__ __forceinline__ void EpCrossDeviceBarrier(EpArgs args, unsigned long 
 /*                                   Combine                                  */
 /* ------------------------------------------------------------------------- */
 template <EpCfg kCfg, typename T>
-__device__ void EpCombineBody(EpArgs args) {
+__device__ void EpCombineBody(EpArgs args, cco::ccoDevComm_t /*devComm*/ = nullptr) {
   constexpr int kNpes = kCfg.worldSize;
   constexpr int kTopk = kCfg.numExpertPerToken;
   constexpr size_t kHidden = static_cast<size_t>(kCfg.hiddenDim);

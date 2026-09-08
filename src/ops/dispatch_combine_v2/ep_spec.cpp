@@ -175,7 +175,8 @@ std::string RenderEpSource(const EpCfg& cfg, const std::string& entry, const cha
          EpDTypeName(cfg.dtype) +
          ";\n"
          "extern \"C\" __global__ void __launch_bounds__(EpBlockThreads(kCfg))\n" +
-         entry + "(EpArgs args) { " + body + "<kCfg, TokT>(args); }\n";
+         entry + "(EpArgs args) { " + body +
+         "<kCfg, TokT>(args, static_cast<::mori::cco::ccoDevComm_t>(args.devComm)); }\n";
 }
 
 const std::vector<std::string>& EpSourceDeps() {

@@ -57,6 +57,8 @@ _REGIONS = {
     "outTok": "out_tok",
     "xdb": "cross_device_barrier",
     "outScales": "out_scales",  # only laid out when scales are on; binds to 0 otherwise
+    "packBuf": "pack_buf",
+    "packTokOff": "pack_tok_off",
 }
 
 # Only what EpDType enumerates -- fp16 is absent because plan_api.DTYPES has no code
@@ -148,6 +150,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # size to the largest combine block_num any variant launches. Portable path
         # never touches it -> left None (binds as 0).
         self.combine_barrier_fan = None
+        self._dev_comm_handle = None
+        self.sdma_pack_slot_map = None
         if self._is1250:
             max_comb_blocks = max(b for b, _ in self._combine_specs)
             if max_comb_blocks > _XDB_FLAG_SLOTS:
@@ -156,6 +160,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     "per-block xdb epoch slots the entry barrier owns"
                 )
             self.combine_barrier_fan = torch.zeros(max_comb_blocks * 16, **i32)
+            self._dev_comm_handle = comm.create_dev_comm()
+            pack_per_peer = cfg.max_num_inp_token_per_rank
+            self.sdma_pack_slot_map = torch.zeros(cfg.world_size * pack_per_peer, **i32)
 
     # -- backend hooks -----------------------------------------------------
 
@@ -189,6 +196,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             ("disp_out", cap * cfg.token_nbytes),
             ("out_tok", cap * cfg.combine_token_nbytes),
             ("cross_device_barrier", cfg.world_size * 8),
+            ("pack_buf", cap * cfg.token_nbytes),
+            ("pack_tok_off", cfg.world_size * 4),
         ]
         if self._scale_i32(cfg):
             # Sized by the DESTINATION stride, which is the caller's row padded to
@@ -279,6 +288,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 **common, **disp_cfg, block_num=b, warp_per_block=w
             )
             plan.bind(rank=cfg.rank)
+            if self._dev_comm_handle is not None:
+                plan.bind(
+                    dev_comm=self._dev_comm_handle.ptr,
+                    sdma_pack_slot_map=self.sdma_pack_slot_map,
+                )
             self._plans.append(plan)
             dispatch[(b, w)] = self._wrap_dispatch(plan)
         for b, w in self._combine_specs:
@@ -303,6 +317,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _close_backend(self):
         for plan in getattr(self, "_plans", ()):
             plan.close()
+        if self._dev_comm_handle is not None:
+            self._dev_comm_handle.close()
+            self._dev_comm_handle = None
 
     # -- views (same contract as the FlyDSL backend) -----------------------
 
