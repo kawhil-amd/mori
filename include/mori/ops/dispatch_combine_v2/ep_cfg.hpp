@@ -387,8 +387,26 @@ constexpr int EpDispatch1250xSlabBytes(const EpCfg& c) {
   const long long total = (long long)wide * c.warpPerBlock;
   return (wide > payload && total <= Ep1250xLdsBytes) ? wide : payload;
 }
+// Batch depth for the SDMA/TDM payload phase: a warp holds this many payload
+// tiles so it can decode + issue that many token loads before a single drain,
+// then store them all -- fewer wait_tensorcnt(0) barriers per token without a
+// software pipeline. Derived to FILL the per-warp LDS share, so it is 1 exactly
+// when one tile already saturates LDS (large hidden at the 16-warp default) and
+// scales up on its own for smaller hidden or fewer warps. Capped so register
+// pressure from the per-lane flat[] array stays bounded.
+constexpr int EpDispatch1250xSdmaBatchCap = 4;
+constexpr int EpDispatch1250xSdmaBatch(const EpCfg& c) {
+  const int slab = EpDispatch1250xSlabBytes(c);
+  if (slab <= 0 || c.warpPerBlock <= 0) return 1;
+  int b = (Ep1250xLdsBytes / c.warpPerBlock) / slab;
+  if (b < 1) b = 1;
+  if (b > EpDispatch1250xSdmaBatchCap) b = EpDispatch1250xSdmaBatchCap;
+  return b;
+}
+// By construction b*slab <= Ep1250xLdsBytes/warpPerBlock, so the product never
+// exceeds the physical LDS ceiling.
 constexpr int EpDispatch1250xLdsBytes(const EpCfg& c) {
-  return c.warpPerBlock * EpDispatch1250xSlabBytes(c);
+  return c.warpPerBlock * EpDispatch1250xSdmaBatch(c) * EpDispatch1250xSlabBytes(c);
 }
 
 // A Cfg that cannot launch is a host-side error, not a kernel that misbehaves.

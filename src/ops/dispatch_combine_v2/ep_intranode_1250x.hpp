@@ -212,20 +212,34 @@ __device__ float _cusplit_stgWt[CUSPLIT_POOL_SLOTS * CUSPLIT_MAX_TOPK];
 __device__ index_t _cusplit_stgSrc[CUSPLIT_POOL_SLOTS];
 __device__ index_t _cusplit_blkBase[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
 __device__ index_t _cusplit_blkCount[CUSPLIT_MAX_BLOCKS * MORI_EP_WORLD_SIZE];
-// SDMA pack+put: per-peer pack slot counters and packSlot↔destTokId mappings.
-// _sdmaPackCount[peer]: how many pack slots allocated for this peer (global atomic).
-// _sdmaPackMap[peer * packCap + packSlot] → destTokId: leader reads for SDMA put addressing.
-// _sdmaEntryPackSlot[peer * packCap + destTokId] → packSlot: SDMA block reads for pack offset.
-__device__ index_t _sdmaPackCount[MORI_EP_WORLD_SIZE];
-__device__ index_t _sdmaPackMap[CUSPLIT_POOL_SLOTS];
-__device__ index_t _sdmaEntryPackSlot[CUSPLIT_POOL_SLOTS];
+// A token goes the SDMA pack+put path iff it hits at least this many REMOTE peers (the
+// local myPe copy never counts). Fewer-peer tokens take the direct TDM path: the SDMA
+// staging/reserve overhead only amortises once a token fans out widely enough.
+constexpr int kSdmaMinRemote = 3;
+// Rank-level contiguous reservation for multi-peer (>=kSdmaMinRemote REMOTE peers) tokens. The
+// whole
+// rank's multi entries to peer p occupy ONE contiguous destination run
+// [_sdmaGbase[p], _sdmaGbase[p]+_sdmaMp[p]) — reserved with a single atomicAdd on the
+// peer's offTokOff — so the leader issues exactly one contiguous put per peer.
+// _sdmaMp[p]: entry count; _sdmaGbase[p]: run base; _sdmaSlot[p]: running LOCAL pack-slot
+// allocator (ps in [0,M_p)). Packing keys off ps (local, known early); the final destination
+// slot is gbase[p]+ps, resolved after the reservation. Packing and the remote reservation of
+// gbase[p] therefore run concurrently: only myPe's gbase is reserved eagerly (cheap local
+// atomic, needed for the local dest copy), the remote gbases are reserved while blocks pack.
+__device__ index_t _sdmaMp[MORI_EP_WORLD_SIZE];
+__device__ index_t _sdmaGbase[MORI_EP_WORLD_SIZE];
+__device__ index_t _sdmaSlot[MORI_EP_WORLD_SIZE];
 // Block-grouping: global token lists for SDMA (multi-peer) vs TDM (single-peer) blocks.
 __device__ int _sdmaTokenCount;
 __device__ index_t _sdmaTokenList[CUSPLIT_POOL_SLOTS];
 __device__ int _tdmTokenCount;
 __device__ index_t _tdmTokenList[CUSPLIT_POOL_SLOTS];
-// Barrier counters for block grouping.
+// Barrier counters. _routingDone is a grid-wide barrier (all blocks). _sdmaAssignDone
+// is a single barrier among the SDMA blocks only: block 0 does the whole count → reserve
+// → assign with block-scope __syncthreads, then this barrier publishes the result to the
+// other SDMA blocks. _sdmaPackDone gates the leader after packing.
 __device__ unsigned int _routingDone;
+__device__ unsigned int _sdmaAssignDone;
 __device__ unsigned int _sdmaPackDone;
 __device__ unsigned int _tdmPayloadDone;
 
@@ -280,6 +294,77 @@ static_assert(kEpScaleStride == 0 || (size_t)kEpScaleSlots * kEpScaleStride <= (
 constexpr size_t kEpScaleStgBytes = kEpScaleSlots * (kEpScaleStride > 0 ? kEpScaleStride : 1);
 __device__ __align__(EpScaleAlign) unsigned char _cusplit_stgScale[kEpScaleStgBytes];
 
+// Batched payload mover for the SDMA/TDM split: each warp takes B tokens from
+// `tokList`, decodes their destinations and issues B loads (one per tile in the
+// warp's tile ring), drains once, then stores every token to its destination(s).
+// Redirect==true is the SDMA path: a token bound for a remote peer is written to
+// the local pack buffer (leader SDMA-puts it later); everything else goes straight
+// to offDispOut. Redirect==false is the TDM path (always direct). B==1 reproduces
+// the original one-token-per-warp loop exactly.
+template <EpCfg kCfg, typename T, int B, bool Redirect>
+__device__ __forceinline__ void EpPackBatch1250x(const EpArgs& args, unsigned long long win,
+                                                 int myPe, const index_t* tokList, int cnt,
+                                                 int warpBase, int totalWarps, T* tileBase,
+                                                 int tileStrideElems,
+                                                 const gfx1250_TDM_GROUP1& g1) {
+  constexpr int WS = kCfg.waveSize;
+  constexpr int npes = kCfg.worldSize;
+  constexpr int topk = kCfg.numExpertPerToken;
+  const size_t hiddenDim = (size_t)kCfg.hiddenDim;
+  const int laneId = threadIdx.x & (WS - 1);
+  const index_t _packCap = (index_t)kCfg.maxTokPerRank;
+  for (int i0 = warpBase * B; i0 < cnt; i0 += totalWarps * B) {
+    index_t flat[B];
+    int active[B];
+#pragma unroll
+    for (int j = 0; j < B; ++j) {
+      flat[j] = EpNullFlat<kCfg>();
+      active[j] = 0;
+      const int idx = i0 + j;  // uniform across the warp
+      if (idx < cnt) {
+        const int tok = tokList[idx];
+        flat[j] = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
+                                  : EpNullFlat<kCfg>();
+        const index_t pe = EpPeFromFlat<kCfg>(flat[j]);
+        const int v = (laneId < topk && pe < (index_t)npes) ? 1 : 0;
+        if (__any(v)) {
+          active[j] = 1;
+          TdmIssueLoad<T>(tileBase + (size_t)j * tileStrideElems,
+                          reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
+                          g1);
+        }
+      }
+    }
+    __builtin_amdgcn_s_wait_tensorcnt(0);  // one drain for all B loads
+#pragma unroll
+    for (int j = 0; j < B; ++j) {
+      if (!active[j]) continue;
+      const index_t peMe = EpPeFromFlat<kCfg>(flat[j]);
+      const int v = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
+      unsigned long long vm = __ballot(v);
+      T* tile = tileBase + (size_t)j * tileStrideElems;
+      while (vm) {
+        const int l = __ffsll((long long)vm) - 1;
+        vm &= vm - 1;
+        const index_t flatv = __shfl(flat[j], l);
+        const index_t destPe = EpPeFromFlat<kCfg>(flatv);
+        const index_t destTokId = EpLocalTokFromFlat<kCfg>(flatv);
+        if (Redirect && destPe != (index_t)myPe && destTokId >= 0 && destTokId < _packCap) {
+          // destTokId carries the LOCAL pack slot ps (assigned before the remote
+          // reservation), so packing never waits on the offTokOff gbase.
+          T* packDst = EpLocal<T>(win, args.offPackBuf) +
+                       ((size_t)destPe * _packCap + destTokId) * hiddenDim;
+          TdmIssueStore<T>(packDst, tile, g1);
+        } else {
+          T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
+          TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, tile, g1);
+        }
+      }
+    }
+    __builtin_amdgcn_s_wait_tensorcnt(0);  // drain stores before tiles are reused
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nullptr) {
   // The macro sizes the staging, the Cfg drives the copies. They come from the same
@@ -317,10 +402,18 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
   // an fp8 payload would otherwise shrink the slab exactly when the metadata got
   // bigger. EpDispatch1250xSlabBytes owns that decision; both tiles must agree.
   constexpr int kSlabBytes = EpDispatch1250xSlabBytes(kCfg);
-  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kSlabBytes);
+  // Each warp owns kSdmaBatch payload tiles; the per-warp region is that wide, and
+  // every phase (metadata staging, payload) strides warps by it. kSdmaBatch==1 at
+  // the large-hidden default, so the region and all offsets are unchanged there.
+  constexpr int kSdmaBatch = EpDispatch1250xSdmaBatch(kCfg);
+  constexpr int kPerWarpSlabBytes = kSlabBytes * kSdmaBatch;
+  constexpr int kSlabElems = kSlabBytes / (int)sizeof(T);
+  T* _tdmTile = reinterpret_cast<T*>(_tdmBatchSmem + (size_t)warpId * kPerWarpSlabBytes);
   const gfx1250_TDM_GROUP1 _tdmG1 = TdmShape<T>(static_cast<int>(hiddenDim));
 
   constexpr int kMaxNpes = kCfg.worldSize;
+  // Single-peer path only: s_N counts single-path entries per peer reserved by this
+  // block; multi-peer tokens are reserved rank-globally in the SDMA sub-phase instead.
   __shared__ index_t s_N[kMaxNpes];
   __shared__ index_t s_base[kMaxNpes];
   __shared__ index_t s_run[kMaxNpes];
@@ -348,11 +441,16 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
     s_run[p] = 0;
   }
   if (blockIdx.x == 0) {
-    for (int p = thdId; p < npes; p += blockDim.x) _sdmaPackCount[p] = 0;
+    for (int p = thdId; p < npes; p += blockDim.x) {
+      _sdmaMp[p] = 0;
+      _sdmaGbase[p] = 0;
+      _sdmaSlot[p] = 0;
+    }
     if (thdId == 0) {
       _sdmaTokenCount = 0;
       _tdmTokenCount = 0;
       _routingDone = 0u;
+      _sdmaAssignDone = 0u;
       _sdmaPackDone = 0u;
       _tdmPayloadDone = 0u;
       __threadfence();
@@ -364,8 +462,14 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
   const bool _dedupOk = ((long long)aWarps * (long long)_etpi >= (long long)args.numTokens);
   int _cDestPe = -1;
   int _cKeep = 0;
-  int _cNumPeers = 0;
+  int _cNumRemote = 0;
   const bool _bdOk = (_etpi == 1);
+  // The SDMA multi-peer path needs the per-token remote-peer count carried from pass 1
+  // to pass 2 (_cNumRemote), which is only valid under _dedupOk. A token is "multi"
+  // (goes SDMA) iff it hits >=kSdmaMinRemote REMOTE peers; local (myPe) copies do not count toward
+  // that test but are still delivered. Keep the whole split behind this one predicate so
+  // the fallback stays byte-identical when it is off.
+  const bool _featOn = (_sdmaEnabled && _bdOk && _dedupOk);
 
   if (args.tokenIndices && args.inpTokenBuf) {
     for (int tokBase = aWarp * _etpi; tokBase < args.numTokens; tokBase += aWarps * _etpi) {
@@ -379,14 +483,23 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
         if (d >= 0 && d < npes) myDestPe = d;
       }
       int keep = 0;
-      int numPeers = 0;
+      int numRemote = 0;
       if (_bdOk) {
         unsigned long long _mine = 0ull;
         for (int p = 0; p < npes; ++p) {
           unsigned long long m = __ballot(myDestPe == p);
           if (myDestPe == p) _mine = m;
-          if (m != 0ull) numPeers++;
-          if (laneId == 0 && m != 0ull) atomicAdd(&s_N[p], 1);
+          if (m != 0ull && p != myPe) numRemote++;
+        }
+        // A multi token (>=kSdmaMinRemote remote peers) is reserved rank-globally in the SDMA
+        // sub-phase, so it adds nothing to s_N here. Single-path tokens reserve every
+        // destination they touch (including a local myPe copy) per block, as before.
+        const bool _multi = (_featOn && numRemote >= kSdmaMinRemote);
+        if (!_multi) {
+          for (int p = 0; p < npes; ++p) {
+            unsigned long long m = __ballot(myDestPe == p);
+            if (laneId == 0 && m != 0ull) atomicAdd(&s_N[p], 1);
+          }
         }
         keep = (myDestPe >= 0 && laneId == (__ffsll((long long)_mine) - 1)) ? 1 : 0;
       } else {
@@ -399,7 +512,7 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
       if (_dedupOk) {
         _cDestPe = myDestPe;
         _cKeep = (act && keep) ? 1 : 0;
-        _cNumPeers = numPeers;
+        _cNumRemote = numRemote;
       }
     }
   }
@@ -410,11 +523,15 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
   for (int p = thdId; p < npes; p += blockDim.x) {
     index_t n = s_N[p];
     if (_blkMapNeeded) _cusplit_blkCount[(size_t)blockIdx.x * npes + p] = n;
+    index_t dbase = 0;
     if (n > 0) {
-      s_base[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n,
-                                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = s_base[p];
+      dbase = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), n, __ATOMIC_RELAXED,
+                                     __HIP_MEMORY_SCOPE_SYSTEM);
+      s_base[p] = dbase;
+      if (_blkMapNeeded) _cusplit_blkBase[(size_t)blockIdx.x * npes + p] = dbase;
       atomicAdd(&args.destPeTokenCounter[p], n);
+    } else {
+      s_base[p] = 0;
     }
   }
   __syncthreads();
@@ -448,8 +565,13 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
         unsigned long long grp = __match_any_sync(0xFFFFFFFFFFFFFFFFull, mv);
         keep = (act && myDestPe >= 0 && laneId == (__ffsll((long long)grp) - 1)) ? 1 : 0;
       }
+      // Multi tokens (>=kSdmaMinRemote remote peers) are reserved/staged rank-globally in
+      // the SDMA sub-phase; here they take no dst slot and leave dispDestTokIdMap null (SDMA
+      // overwrites it). Only single-path entries are reserved and staged in this pass.
+      const bool _multi = (_featOn && _cNumRemote >= kSdmaMinRemote);
+      const int keepEff = (keep && !_multi) ? 1 : 0;
       index_t myDestTokId = -1;
-      if (keep) {
+      if (keepEff) {
         index_t j = atomicAdd(&s_run[myDestPe], 1);
         myDestTokId = s_base[myDestPe] + j;
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] =
@@ -460,7 +582,7 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
       } else if (act) {
         args.dispDestTokIdMap[(size_t)tok * topk + _eLane] = EpNullFlat<kCfg>();
       }
-      unsigned long long keepMask = __ballot(keep);
+      unsigned long long keepMask = __ballot(keepEff);
       while (keepMask) {
         int srcLane = -1;
         unsigned long long t = keepMask;
@@ -515,18 +637,13 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
             }
           }
         }
-        if (_sdmaEnabled && _bdOk && _cNumPeers >= 2 && d != myPe) {
-          if (myE == 0) {
-            index_t ps = atomicAdd(&_sdmaPackCount[d], 1);
-            if (ps < _stgCap) {
-              _sdmaPackMap[(size_t)d * _stgCap + ps] = dt;
-              _sdmaEntryPackSlot[(size_t)d * _stgCap + dt] = ps;
-            }
-          }
-        }
       }
-      if (_sdmaEnabled && _bdOk && laneId == 0 && _cNumPeers > 0 && tok < args.numTokens) {
-        if (_cNumPeers >= 2) {
+      // Route the token to the SDMA list (>=kSdmaMinRemote remote peers) or the TDM list
+      // (any other token that still has a destination, including a purely-local one).
+      // __ballot must be warp-uniform, so compute the "has any destination" mask first.
+      const bool _hasDest = (__ballot(myDestPe >= 0) != 0ull);
+      if (_sdmaEnabled && _bdOk && laneId == 0 && _hasDest && tok < args.numTokens) {
+        if (_featOn && _cNumRemote >= kSdmaMinRemote) {
           _sdmaTokenList[atomicAdd(&_sdmaTokenCount, 1)] = tok;
         } else {
           _tdmTokenList[atomicAdd(&_tdmTokenCount, 1)] = tok;
@@ -549,7 +666,10 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
     // 128B of slack per field region for the rounding below.
     const int tokCapM = (perTokM > 0) ? ((mtileBytesM - 128 * kMetaFields) / perTokM) : 0;
     if (tokCapM > 0) {
-      uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * mtileBytesM;
+      // Capacity math uses one tile (mtileBytesM); the offset uses the full
+      // per-warp region so metadata tiles of adjacent warps do not overlap when
+      // kSdmaBatch > 1.
+      uint8_t* _m4 = reinterpret_cast<uint8_t*>(_tdmBatchSmem) + (size_t)warpId * kPerWarpSlabBytes;
       const int _peerSplit = (npes > 0 && warpNum >= npes) ? (warpNum / npes) : 1;
       const int split = (aWarps > 0 && args.numTokens <= (index_t)aWarps * 2) ? 1 : _peerSplit;
       const int nRuns = npes * split;
@@ -695,83 +815,174 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
   const bool _isSdmaBlock = _sdmaEnabled && ((int)blockIdx.x < kSdmaBlocks);
   const bool _isTdmBlock = _sdmaEnabled && ((int)blockIdx.x >= kSdmaBlocks);
 
+  // ── SDMA assignment sub-phase (block 0 alone) ──
+  // Multi tokens were deferred by routing. Block 0 counts this rank's multi entries per peer
+  // (Pass A), then assigns each (token, peer) entry a LOCAL pack slot ps in [0,M_p) (Pass B)
+  // and fills the pack-facing dispDestTokIdMap (peer, ps). The remote destination base
+  // gbase[p] is deliberately NOT needed here: packing keys off ps, so it can start as soon as
+  // the assignment publishes. Only myPe's gbase is reserved eagerly (cheap local atomic) so
+  // the local dest copy can resolve its final slot during packing. The remote gbase[p]
+  // reservations — the high-latency system-scope atomics on peer offTokOff — are issued right
+  // after the publish barrier and overlap packing (below); the per-peer metadata and the
+  // dispDestTokIdMap finalize (peer, gbase+ps) happen at the tail once gbase is known.
+  // A single grid barrier (_sdmaAssignDone, SDMA blocks only) publishes the assignment.
+  if (_isSdmaBlock && args.tokenIndices && args.inpTokenBuf) {
+    const int sdmaCnt =
+        __hip_atomic_load(&_sdmaTokenCount, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    if (blockIdx.x == 0) {
+      // Pass A: count this rank's multi entries per peer (one per (token, peer), dedup'd).
+      // Block 0's own warps partition the multi list.
+      for (int idx = warpId; idx < sdmaCnt; idx += warpNum) {
+        int tok = _sdmaTokenList[idx];
+        index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : -1;
+        int myDestPe = -1;
+        if (myExpert >= 0) {
+          int d = (int)(myExpert / kCfg.numExpertPerRank);
+          if (d >= 0 && d < npes) myDestPe = d;
+        }
+        unsigned long long _mine = 0ull;
+        for (int p = 0; p < npes; ++p) {
+          unsigned long long m = __ballot(myDestPe == p);
+          if (myDestPe == p) _mine = m;
+        }
+        if (myDestPe >= 0 && laneId == (__ffsll((long long)_mine) - 1))
+          atomicAdd(&_sdmaMp[myDestPe], 1);
+      }
+      __syncthreads();
+
+      // Eager LOCAL reserve only: reserve myPe's contiguous run [gbase, gbase+M_myPe) so the
+      // local dest copy (else-branch of the packer) can write its final destination slot
+      // during packing. This is a local atomic (low latency). The REMOTE gbases are deferred
+      // to overlap packing. Also seed _sdmaGbase[remote]=0 (finalized after the barrier).
+      for (int p = thdId; p < npes; p += blockDim.x) {
+        if (p == myPe) {
+          index_t m = _sdmaMp[myPe];
+          if (m > 0) {
+            _sdmaGbase[myPe] = __hip_atomic_fetch_add(EpPeer<index_t>(win, myPe, args.offTokOff), m,
+                                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            atomicAdd(&args.destPeTokenCounter[myPe], m);
+          } else {
+            _sdmaGbase[myPe] = 0;
+          }
+        } else {
+          _sdmaGbase[p] = 0;
+        }
+      }
+      __syncthreads();
+
+      // Pass B: assign each (token, peer) entry a LOCAL pack slot ps = atomicAdd(_sdmaSlot[p]).
+      // For the local dest (peer==myPe) the final slot gbase[myPe]+ps is known now, so we write
+      // dispDestTokIdMap and the local metadata here. For remote dests dispDestTokIdMap holds
+      // the ps placeholder (peer, ps); their metadata + finalize (peer, gbase+ps) run at the tail.
+      for (int idx = warpId; idx < sdmaCnt; idx += warpNum) {
+        int tok = _sdmaTokenList[idx];
+        index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : -1;
+        int myDestPe = -1;
+        if (myExpert >= 0) {
+          int d = (int)(myExpert / kCfg.numExpertPerRank);
+          if (d >= 0 && d < npes) myDestPe = d;
+        }
+        unsigned long long _mine = 0ull;
+        for (int p = 0; p < npes; ++p) {
+          unsigned long long m = __ballot(myDestPe == p);
+          if (myDestPe == p) _mine = m;
+        }
+        int keeperLane = (myDestPe >= 0) ? (__ffsll((long long)_mine) - 1) : -1;
+        int keep = (myDestPe >= 0 && laneId == keeperLane) ? 1 : 0;
+        // Local pack slot ps in [0, M_p). For the local dest we can already form the final
+        // destination slot gbase[myPe]+ps; for remote dests dispDestTokIdMap carries ps as a
+        // placeholder (finalized to gbase+ps at the tail once the remote run is reserved).
+        index_t myVal = -1;
+        if (keep) {
+          index_t ps = atomicAdd(&_sdmaSlot[myDestPe], 1);
+          myVal = (myDestPe == myPe) ? (_sdmaGbase[myPe] + ps) : ps;
+        }
+        // Broadcast the keeper's value to every lane of the peer group.
+        int kl = (keeperLane >= 0) ? keeperLane : 0;
+        index_t val = (myDestPe >= 0) ? __shfl(myVal, kl) : (index_t)-1;
+        if (laneId < topk) {
+          args.dispDestTokIdMap[(size_t)tok * topk + laneId] =
+              (myDestPe >= 0) ? EpFlatIndex<kCfg>(myDestPe, val) : EpNullFlat<kCfg>();
+        }
+        // Only the LOCAL dest's metadata can be written here (its final slot is known). Remote
+        // dest metadata is deferred to the tail once gbase[peer] is reserved.
+        if (keep && myDestPe == myPe && val >= 0) {
+          const int d = myPe;
+          const index_t slot = val;
+          // Metadata straight to the peer's contiguous slot (small per-token payload).
+          index_t* dI = EpPeer<index_t>(win, d, args.offOutIdx) + (size_t)slot * topk;
+          for (int e = 0; e < topk; ++e) dI[e] = args.tokenIndices[(size_t)tok * topk + e];
+          if constexpr (kCfg.useWeights) {
+            if (args.weightsBuf) {
+              float* dW = EpPeer<float>(win, d, args.offOutWts) + (size_t)slot * topk;
+              for (int e = 0; e < topk; ++e) dW[e] = args.weightsBuf[(size_t)tok * topk + e];
+            }
+          }
+          EpPeer<index_t>(win, d, args.offRecvToSrc)[slot] = EpSrcTokIndex<kCfg>(myPe, tok);
+          if constexpr (kEpScaleBytes > 0) {
+            if (args.scalesBuf) {
+              constexpr int kSdw = kEpScaleStride / 4;
+              constexpr int kSrcDw = kEpScaleBytes / 4;
+              unsigned int* dS =
+                  EpPeer<unsigned int>(win, d, args.offOutScales) + (size_t)slot * kSdw;
+              const unsigned int* sS =
+                  reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)tok * kSrcDw;
+              for (int e = 0; e < kSrcDw; ++e) dS[e] = sS[e];
+              for (int e = kSrcDw; e < kSdw; ++e) dS[e] = 0u;
+            }
+          }
+        }
+      }
+      __syncthreads();
+    }
+
+    // Publish barrier (SDMA blocks only): block 0's dispDestTokIdMap (peer, ps) and Mp are
+    // visible to every SDMA block before EpPackBatch reads them to pack by local slot ps.
+    __threadfence();
+    if (thdId == 0) atomicAdd(&_sdmaAssignDone, 1u);
+    if (thdId == 0)
+      while (__hip_atomic_load(&_sdmaAssignDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+             (unsigned int)kSdmaBlocks) {
+      }
+    __syncthreads();
+
+    // Remote reservation, overlapped with packing: warp 0 of block 0 pays the high-latency
+    // system-scope offTokOff atomics for every remote peer while all other SDMA warps race
+    // ahead to pack (they need only ps, published above). NO barrier follows — the results in
+    // _sdmaGbase[peer] are consumed at the tail, after packing, under the pack-done barrier.
+    if (blockIdx.x == 0 && warpId == 0) {
+      for (int p = laneId; p < npes; p += WS) {
+        if (p == myPe) continue;
+        index_t m = _sdmaMp[p];
+        if (m > 0) {
+          _sdmaGbase[p] = __hip_atomic_fetch_add(EpPeer<index_t>(win, p, args.offTokOff), m,
+                                                 __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          atomicAdd(&args.destPeTokenCounter[p], m);
+        }
+      }
+    }
+  }
+
   if (_sdmaEnabled && args.tokenIndices && args.inpTokenBuf) {
-    const index_t _packCap = (index_t)kCfg.maxTokPerRank;
     if (_isSdmaBlock) {
-      // SDMA blocks: process multi-peer tokens from the global list.
+      // SDMA blocks: pack multi-peer tokens (remote dests → local pack buffer).
       const int sdmaWarpId = (int)blockIdx.x * warpNum + warpId;
       const int sdmaTotalWarps = kSdmaBlocks * warpNum;
       const int sdmaCnt =
           __hip_atomic_load(&_sdmaTokenCount, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      for (int i = sdmaWarpId; i < sdmaCnt; i += sdmaTotalWarps) {
-        int tok = _sdmaTokenList[i];
-        index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
-                                         : EpNullFlat<kCfg>();
-        index_t peMe = EpPeFromFlat<kCfg>(flatMe);
-        int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
-        if (!__any(validMe)) continue;
-        TdmIssueLoad<T>(_tdmTile,
-                        reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
-                        _tdmG1);
-        bool loadWaited = false;
-        unsigned long long _vm = __ballot(validMe);
-        while (_vm) {
-          int l = __ffsll((long long)_vm) - 1;
-          _vm &= _vm - 1;
-          index_t flat = __shfl(flatMe, l);
-          index_t destPe = EpPeFromFlat<kCfg>(flat);
-          index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
-          if (!loadWaited) {
-            __builtin_amdgcn_s_wait_tensorcnt(0);
-            loadWaited = true;
-          }
-          if (destPe != (index_t)myPe && destTokId < _stgCap) {
-            index_t ps = _sdmaEntryPackSlot[(size_t)destPe * _stgCap + destTokId];
-            if (ps >= 0 && ps < _packCap) {
-              T* packDst =
-                  EpLocal<T>(win, args.offPackBuf) + ((size_t)destPe * _packCap + ps) * hiddenDim;
-              TdmIssueStore<T>(packDst, _tdmTile, _tdmG1);
-            }
-          } else {
-            T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
-            TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
-          }
-        }
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-      }
+      EpPackBatch1250x<kCfg, T, kSdmaBatch, true>(args, win, myPe, _sdmaTokenList, sdmaCnt,
+                                                  sdmaWarpId, sdmaTotalWarps, _tdmTile, kSlabElems,
+                                                  _tdmG1);
     } else {
-      // TDM blocks: process single-peer tokens from the global list.
+      // TDM blocks: single-peer tokens go straight to the peer's offDispOut.
       const int tdmLocalWarp = ((int)blockIdx.x - kSdmaBlocks) * warpNum + warpId;
       const int tdmTotalWarps = ((int)gridDim.x - kSdmaBlocks) * warpNum;
       const int tdmCnt =
           __hip_atomic_load(&_tdmTokenCount, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-      for (int i = tdmLocalWarp; i < tdmCnt; i += tdmTotalWarps) {
-        int tok = _tdmTokenList[i];
-        index_t flatMe = (laneId < topk) ? args.dispDestTokIdMap[(size_t)tok * topk + laneId]
-                                         : EpNullFlat<kCfg>();
-        index_t peMe = EpPeFromFlat<kCfg>(flatMe);
-        int validMe = (laneId < topk && peMe < (index_t)npes) ? 1 : 0;
-        if (!__any(validMe)) continue;
-        TdmIssueLoad<T>(_tdmTile,
-                        reinterpret_cast<const T*>(args.inpTokenBuf) + (size_t)tok * hiddenDim,
-                        _tdmG1);
-        bool loadWaited = false;
-        unsigned long long _vm = __ballot(validMe);
-        while (_vm) {
-          int l = __ffsll((long long)_vm) - 1;
-          _vm &= _vm - 1;
-          index_t flat = __shfl(flatMe, l);
-          index_t destPe = EpPeFromFlat<kCfg>(flat);
-          index_t destTokId = EpLocalTokFromFlat<kCfg>(flat);
-          if (!loadWaited) {
-            __builtin_amdgcn_s_wait_tensorcnt(0);
-            loadWaited = true;
-          }
-          T* _dbase = EpPeer<T>(win, destPe, args.offDispOut);
-          TdmIssueStore<T>(_dbase + (size_t)destTokId * hiddenDim, _tdmTile, _tdmG1);
-        }
-        __builtin_amdgcn_s_wait_tensorcnt(0);
-      }
+      EpPackBatch1250x<kCfg, T, kSdmaBatch, false>(args, win, myPe, _tdmTokenList, tdmCnt,
+                                                   tdmLocalWarp, tdmTotalWarps, _tdmTile,
+                                                   kSlabElems, _tdmG1);
     }
   } else if (!_sdmaEnabled && args.tokenIndices && args.inpTokenBuf) {
     // Original path when SDMA is not enabled (non-gfx1250 or no devComm).
@@ -814,78 +1025,134 @@ __device__ void EpDispatch1250xBody(EpArgs args, cco::ccoDevComm_t devComm = nul
     // Block-grouped barrier: SDMA blocks + TDM blocks signal independently.
     if (_isSdmaBlock) {
       __threadfence();
-      unsigned int _myPackOrder = 0;
-      if (thdId == 0) _myPackOrder = atomicAdd(&_sdmaPackDone, 1u);
-      // Broadcast to all threads so the whole block knows if it is leader.
-      __shared__ unsigned int s_packOrder;
-      if (thdId == 0) s_packOrder = _myPackOrder;
-      __syncthreads();
-      _myPackOrder = s_packOrder;
+      if (thdId == 0) atomicAdd(&_sdmaPackDone, 1u);
+      // Leader is block 0: it reserved _sdmaGbase[remote] concurrently with packing and reads
+      // it back here for the metadata finalize and the put, so those arrays never need
+      // cross-block publishing. Wait until every SDMA block has finished packing, then fence so
+      // those packing stores are visible before the put reads them.
+      if (blockIdx.x == 0) {
+        if (thdId == 0)
+          while (__hip_atomic_load(&_sdmaPackDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+                 (unsigned int)kSdmaBlocks) {
+          }
+        __syncthreads();  // pack-done + warp-0's _sdmaGbase[remote] visible to all block-0 warps
+        __threadfence();
 
-      if (_myPackOrder == (unsigned int)(kSdmaBlocks - 1) && warpId == 0) {
-        // SDMA leader: last SDMA block to finish packing.
-        const cco::ccoWindow_t ccoWin = reinterpret_cast<cco::ccoWindow_t>(win);
-        cco::ccoSdma sdma(*devComm);
-        const size_t rowBytes = hiddenDim * sizeof(T);
-        const index_t packCap = (index_t)kCfg.maxTokPerRank;
-        for (int peer = laneId; peer < npes; peer += WS) {
-          if (peer == myPe) continue;
-          index_t cnt = _sdmaPackCount[peer];
-          if (cnt <= 0) continue;
-          if (cnt > packCap) cnt = packCap;
-          for (index_t s = 0; s < cnt; ++s) {
-            index_t dt = _sdmaPackMap[(size_t)peer * _stgCap + s];
-            if (dt < 0) continue;
-            size_t srcOff = args.offPackBuf + ((size_t)peer * packCap + s) * rowBytes;
-            size_t dstOff = args.offDispOut + (size_t)dt * rowBytes;
+        // Finalize the remote entries now that gbase[peer] is reserved. All block-0 warps
+        // partition the multi list (mirrors Pass B): rewrite dispDestTokIdMap from the ps
+        // placeholder to the final (peer, gbase+ps), and the keeper lane writes the peer
+        // metadata at gbase+ps. Packers already consumed the ps map, so overwriting is safe.
+        const int sdmaCnt =
+            __hip_atomic_load(&_sdmaTokenCount, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        for (int idx = warpId; idx < sdmaCnt; idx += warpNum) {
+          int tok = _sdmaTokenList[idx];
+          index_t myExpert = (laneId < topk) ? args.tokenIndices[(size_t)tok * topk + laneId] : -1;
+          int myDestPe = -1;
+          if (myExpert >= 0) {
+            int d = (int)(myExpert / kCfg.numExpertPerRank);
+            if (d >= 0 && d < npes) myDestPe = d;
+          }
+          unsigned long long _mine = 0ull;
+          for (int p = 0; p < npes; ++p) {
+            unsigned long long mb = __ballot(myDestPe == p);
+            if (myDestPe == p) _mine = mb;
+          }
+          int keeperLane = (myDestPe >= 0) ? (__ffsll((long long)_mine) - 1) : -1;
+          int keep = (myDestPe >= 0 && laneId == keeperLane) ? 1 : 0;
+          // Remote entries only (the local dest was finalized in Pass B).
+          if (myDestPe >= 0 && myDestPe != myPe && laneId < topk) {
+            const int d = myDestPe;
+            index_t ps =
+                EpLocalTokFromFlat<kCfg>(args.dispDestTokIdMap[(size_t)tok * topk + laneId]);
+            index_t slot = _sdmaGbase[d] + ps;
+            args.dispDestTokIdMap[(size_t)tok * topk + laneId] = EpFlatIndex<kCfg>(d, slot);
+            if (keep) {
+              index_t* dI = EpPeer<index_t>(win, d, args.offOutIdx) + (size_t)slot * topk;
+              for (int e = 0; e < topk; ++e) dI[e] = args.tokenIndices[(size_t)tok * topk + e];
+              if constexpr (kCfg.useWeights) {
+                if (args.weightsBuf) {
+                  float* dW = EpPeer<float>(win, d, args.offOutWts) + (size_t)slot * topk;
+                  for (int e = 0; e < topk; ++e) dW[e] = args.weightsBuf[(size_t)tok * topk + e];
+                }
+              }
+              EpPeer<index_t>(win, d, args.offRecvToSrc)[slot] = EpSrcTokIndex<kCfg>(myPe, tok);
+              if constexpr (kEpScaleBytes > 0) {
+                if (args.scalesBuf) {
+                  constexpr int kSdw = kEpScaleStride / 4;
+                  constexpr int kSrcDw = kEpScaleBytes / 4;
+                  unsigned int* dS =
+                      EpPeer<unsigned int>(win, d, args.offOutScales) + (size_t)slot * kSdw;
+                  const unsigned int* sS =
+                      reinterpret_cast<const unsigned int*>(args.scalesBuf) + (size_t)tok * kSrcDw;
+                  for (int e = 0; e < kSrcDw; ++e) dS[e] = sS[e];
+                  for (int e = kSrcDw; e < kSdw; ++e) dS[e] = 0u;
+                }
+              }
+            }
+          }
+        }
+        __threadfence();  // remote metadata visible before the put/signaling
+        __syncthreads();
+
+        if (warpId == 0) {
+          // SDMA leader (block 0): one fully contiguous put per peer.
+          const cco::ccoWindow_t ccoWin = reinterpret_cast<cco::ccoWindow_t>(win);
+          cco::ccoSdma sdma(*devComm);
+          const size_t rowBytes = hiddenDim * sizeof(T);
+          const index_t packCap = (index_t)kCfg.maxTokPerRank;
+          // One fully contiguous put per peer: the whole rank's multi entries to peer p
+          // occupy pack rows [0, M_p) and destination rows [gbase_p, gbase_p+M_p).
+          for (int peer = laneId; peer < npes; peer += WS) {
+            if (peer == myPe) continue;
+            index_t m = _sdmaMp[peer];
+            if (m <= 0) continue;
+            size_t srcOff = args.offPackBuf + (size_t)peer * packCap * rowBytes;
+            size_t dstOff = args.offDispOut + (size_t)_sdmaGbase[peer] * rowBytes;
             sdma.put<cco::ccoCoopThread, false, false, cco::ccoSdmaOptFlagsAggregate,
-                     cco::ccoSdmaThreadIndependent>(peer, ccoWin, dstOff, ccoWin, srcOff, rowBytes,
-                                                    0);
+                     cco::ccoSdmaThreadIndependent>(peer, ccoWin, dstOff, ccoWin, srcOff,
+                                                    (size_t)m * rowBytes, 0);
+            sdma.commit<cco::ccoCoopThread>(peer, 0);
           }
-          sdma.commit<cco::ccoCoopThread>(peer, 0);
-        }
-        for (int peer = laneId; peer < npes; peer += WS) {
-          if (peer == myPe) continue;
-          index_t cnt = _sdmaPackCount[peer];
-          if (cnt <= 0) continue;
-          sdma.quietQueue<cco::ccoCoopThread>(peer, 0);
-        }
-
-        // Wait for TDM blocks to finish their payload.
-        const unsigned int tdmBlocks = (unsigned int)gridDim.x - (unsigned int)kSdmaBlocks;
-        if (tdmBlocks > 0) {
-          while (__hip_atomic_load(&_tdmPayloadDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
-                 tdmBlocks) {
+          for (int peer = laneId; peer < npes; peer += WS) {
+            if (peer == myPe) continue;
+            if (_sdmaMp[peer] <= 0) continue;
+            sdma.quietQueue<cco::ccoCoopThread>(peer, 0);
           }
-        }
 
-        // Peer signaling.
-        for (int destPe = laneId; destPe < npes; destPe += WS) {
-          index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
-          EpWaitEq(signal, 0);
-          index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
-                                                     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
-                                   1;
-          __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-          __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-        }
-      }
-      // SDMA leader block, warp 0: wait for recv signals.
-      if (_myPackOrder == (unsigned int)(kSdmaBlocks - 1) && warpId == 0) {
-        index_t myRecv = 0;
-        for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
-          index_t* signal = recvTokenNums + srcPe;
-          index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
-          __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-          myRecv += recvTokenNum;
-          args.destPeTokenCounter[srcPe] = 0;
-        }
-        for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
-        if (laneId == 0) {
-          *args.totalRecvTokenNum = myRecv;
-          EpLocal<index_t>(win, args.offTokOff)[0] = 0;
-        }
-      }
+          // Wait for TDM blocks to finish their payload.
+          const unsigned int tdmBlocks = (unsigned int)gridDim.x - (unsigned int)kSdmaBlocks;
+          if (tdmBlocks > 0) {
+            while (__hip_atomic_load(&_tdmPayloadDone, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) <
+                   tdmBlocks) {
+            }
+          }
+
+          // Peer signaling.
+          for (int destPe = laneId; destPe < npes; destPe += WS) {
+            index_t* signal = EpPeer<index_t>(win, destPe, args.offRecvNum) + myPe;
+            EpWaitEq(signal, 0);
+            index_t numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
+                                                       __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
+                                     1;
+            __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+          }
+          // Wait for recv signals.
+          index_t myRecv = 0;
+          for (int srcPe = laneId; srcPe < npes; srcPe += WS) {
+            index_t* signal = recvTokenNums + srcPe;
+            index_t recvTokenNum = EpWaitGt(signal, 0) - 1;
+            __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+            myRecv += recvTokenNum;
+            args.destPeTokenCounter[srcPe] = 0;
+          }
+          for (int off = WS / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off, WS);
+          if (laneId == 0) {
+            *args.totalRecvTokenNum = myRecv;
+            EpLocal<index_t>(win, args.offTokOff)[0] = 0;
+          }
+        }  // if (warpId == 0)
+      }  // if (blockIdx.x == 0)
     } else {
       // TDM block: signal completion and exit.
       __threadfence();
