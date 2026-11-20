@@ -301,7 +301,7 @@ def main():
             combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
             scale_dim=SCALE_DIM,
             scale_type_size=SCALE_TS,
-            kernel_backend=backend,
+            kernel_backend=backend[:-3] if backend.endswith("_ll") else backend,
             dispatch_block_num=_G["DBN"],
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
@@ -309,7 +309,8 @@ def main():
             quant_type=PUSH_QUANT if _PUSH else "none",
             async_ll=ASYNC_LL,
             async_ll_transport=ASYNC_LL_TRANSPORT,
-            ll_dispatch=bool(int(os.environ.get("LL_DISPATCH", 0))),
+            ll_dispatch=backend.endswith("_ll")
+            or bool(int(os.environ.get("LL_DISPATCH", 0))),
         )
         return EpDispatchCombineOp(cfg, comm)
 
