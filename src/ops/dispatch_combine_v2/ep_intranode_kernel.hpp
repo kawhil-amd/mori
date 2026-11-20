@@ -164,49 +164,88 @@ struct EpMultiWarpIter {
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
-// Dispatch's tail, shared by both bodies: every block arrives at the grid barrier,
-// then one warp announces this rank's per-destination counts and reads back everyone
-// else's.
+// Dispatch's tail, shared by both bodies: every block reports in, then this rank's
+// per-destination counts go out and everyone else's come back.
+//
+// Tickets on the arrival counter rather than a spin on it, after the gfx125x body
+// (ep_intranode_1250x.hpp). Every block draws one; the FIRST arriver drains the
+// peers' signal slots and then draws a second; the HIGHEST draw publishes the
+// counts. Holding the highest ticket implies both preconditions of that store --
+// every block in, so destPeTokenCounter is a complete sum, and the drain observed.
+//
+// Two things this buys over spinning in block 0:
+//   * the drain -- waiting for each peer to have consumed the PREVIOUS call's
+//     signal -- is a fabric round trip on uncached peer memory, and its address
+//     depends only on destPe, so it needs nothing the barrier gives. On the first
+//     arriver it is spent while the other blocks are still copying; after the
+//     barrier it is exposed.
+//   * the warp that waits is whichever block got here first, not block 0, which
+//     may arrive early and then spin for the whole of everyone else's work.
 template <EpCfg kCfg>
 __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
   constexpr int kNpes = kCfg.worldSize;
+  constexpr unsigned kNoTicket = ~0u;
   const int myPe = args.rank;
   const int thdId = threadIdx.x;
   const int laneId = threadIdx.x & (kCfg.waveSize - 1);
-  const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + thdId / kCfg.waveSize;
+  const int warpId = thdId / kCfg.waveSize;
   const unsigned long long win = args.window;
 
   __syncthreads();
-  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
 
-  // Phase 2: one warp announces this rank's per-destination counts, then reads
-  // back everyone else's. The grid barrier is hoisted before the peer loop so
-  // that wide EP (worldSize > waveSize) multi-iterates safely.
-  if (globalWarpId == 0) {
-    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
-    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  unsigned arriveTicket = 0;
+  if (thdId == 0) arriveTicket = atomicAdd(args.gridBarrier, 1u);
+  if (warpId == 0) arriveTicket = (unsigned)__shfl((int)arriveTicket, 0);
+  const bool isFirstArriver = (warpId == 0) && (arriveTicket == 0u);
 
+  unsigned drainTicket = kNoTicket;
+  if (isFirstArriver) {
+    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
+      EpWaitEq(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, 0);
+    }
+    if (laneId == 0) drainTicket = atomicAdd(args.gridBarrier, 1u);
+    drainTicket = (unsigned)__shfl((int)drainTicket, 0);
+  }
+
+  // atomicAdd returns the pre-increment value, so gridDim.x + 1 draws read
+  // 0 .. gridDim.x: the highest TICKET, not the counter's final value.
+  const unsigned kHighestTicket = gridDim.x;
+  if ((warpId == 0) && (arriveTicket == kHighestTicket || drainTicket == kHighestTicket)) {
     for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
       // +1 so a zero-token destination still sees a distinct "signal arrived".
       const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
                                  1;
-      int* signal = EpPeer<int>(win, destPe, args.offRecvNum) + myPe;
-      EpWaitEq(signal, 0);
       __threadfence_system();
-      __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      // Cleared here, by the warp that just read it: the inbound loop below runs on
+      // the first arriver, which may reach it before this warp has read the sum.
+      args.destPeTokenCounter[destPe] = 0;
     }
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+  }
 
+  // Inbound rides the first arriver so it is already parked when the peers' signals
+  // land. It cannot move above the outbound store on the same warp: this rank would
+  // wait on a peer that is waiting on this rank, with neither having sent. Separate
+  // tickets are what break that cycle.
+  if (isFirstArriver) {
+    int myRecv = 0;
     int* recvTokenNums = EpLocal<int>(win, args.offRecvNum);
     for (int srcPe = laneId; srcPe < kNpes; srcPe += kCfg.waveSize) {
       int* signal = recvTokenNums + srcPe;
-      const int recvTokenNum = EpWaitGt(signal, 0) - 1;
+      myRecv += EpWaitGt(signal, 0) - 1;
       __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-      atomicAdd(args.totalRecvTokenNum, recvTokenNum);
-      args.destPeTokenCounter[srcPe] = 0;
     }
-
-    if (laneId == 0) EpLocal<int>(win, args.offTokOff)[0] = 0;
+    // One store instead of an atomicAdd a source -- and the total no longer depends
+    // on the body having zeroed it, which block 0 did and block 0 is not necessarily
+    // the warp that lands here.
+    for (int off = kCfg.waveSize / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off);
+    if (laneId == 0) {
+      *args.totalRecvTokenNum = myRecv;
+      EpLocal<int>(win, args.offTokOff)[0] = 0;
+    }
   }
 }
 
@@ -227,10 +266,6 @@ __device__ void EpDispatchBody(EpArgs args) {
   const int globalWarpNum = gridDim.x * warpNum;
 
   const unsigned long long win = args.window;
-
-  // Reset the count Phase 2 accumulates into. Ordered before those adds by the
-  // __syncthreads() below (same warp); combine only reads it.
-  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
 
   // Phase 1: route and send. One warp per (token, top-k slot).
   if (args.tokenIndices && args.inpTokenBuf) {
@@ -434,16 +469,12 @@ __device__ void EpDispatchLLBody(EpArgs args) {
   const int thdId = threadIdx.x;
   const int laneId = thdId & (kCfg.waveSize - 1);
   const int warpId = thdId / kCfg.waveSize;
-  const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + warpId;
   const unsigned long long win = args.window;
   const int numTokens = args.numTokens;
 
   using Vec = typename core::VecTypeSelector<16>::dataType;
 
   __shared__ EpLlRoute<EpLlMaxDests(kCfg)> routeBuf[2];
-
-  // Reset the count the notify step accumulates into; same warp, so ordered before it.
-  if (globalWarpId == 0 && laneId == 0) *args.totalRecvTokenNum = 0;
 
   const int copyWarp = warpId - kCtrl;
   const int rowCount = kEvenRows ? kRows / kCopyWarps : EpLlRowCount(kCfg, copyWarp);
