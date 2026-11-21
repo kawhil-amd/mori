@@ -164,6 +164,51 @@ struct EpMultiWarpIter {
 /* ------------------------------------------------------------------------- */
 /*                                  Dispatch                                  */
 /* ------------------------------------------------------------------------- */
+// The spin form: every block adds to the arrival counter, block 0's warp 0 waits for
+// the full count, then announces this rank's per-destination counts and reads back
+// everyone else's. What both bodies used before the ticket form below.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchNotifySpin(EpArgs args) {
+  constexpr int kNpes = kCfg.worldSize;
+  const int myPe = args.rank;
+  const int thdId = threadIdx.x;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  const int globalWarpId = blockIdx.x * kCfg.warpPerBlock + thdId / kCfg.waveSize;
+  const unsigned long long win = args.window;
+
+  __syncthreads();
+  if (thdId == 0) atomicAdd(args.gridBarrier, 1u);
+
+  if (globalWarpId == 0) {
+    EpWaitEq(args.gridBarrier, static_cast<unsigned int>(gridDim.x));
+    __hip_atomic_store(args.gridBarrier, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+
+    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
+      const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
+                                                   __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
+                                 1;
+      int* signal = EpPeer<int>(win, destPe, args.offRecvNum) + myPe;
+      EpWaitEq(signal, 0);
+      __threadfence_system();
+      __hip_atomic_store(signal, numTokenSignal, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+
+    int myRecv = 0;
+    int* recvTokenNums = EpLocal<int>(win, args.offRecvNum);
+    for (int srcPe = laneId; srcPe < kNpes; srcPe += kCfg.waveSize) {
+      int* signal = recvTokenNums + srcPe;
+      myRecv += EpWaitGt(signal, 0) - 1;
+      __hip_atomic_store(signal, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      args.destPeTokenCounter[srcPe] = 0;
+    }
+    for (int off = kCfg.waveSize / 2; off > 0; off >>= 1) myRecv += __shfl_down(myRecv, off);
+    if (laneId == 0) {
+      *args.totalRecvTokenNum = myRecv;
+      EpLocal<int>(win, args.offTokOff)[0] = 0;
+    }
+  }
+}
+
 // Dispatch's tail, shared by both bodies: every block reports in, then this rank's
 // per-destination counts go out and everyone else's come back.
 //
@@ -183,6 +228,14 @@ struct EpMultiWarpIter {
 //     may arrive early and then spin for the whole of everyone else's work.
 template <EpCfg kCfg>
 __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
+  if constexpr (!kCfg.llDispatch) {
+    // The portable body keeps the spin: it is the shipped path, the tickets buy it
+    // little (its own kernel is long enough that the drain hides in it), and this
+    // way enabling llDispatch is the only thing that changes behaviour here.
+    EpDispatchNotifySpin<kCfg>(args);
+    return;
+  }
+
   constexpr int kNpes = kCfg.worldSize;
   constexpr unsigned kNoTicket = ~0u;
   const int myPe = args.rank;
