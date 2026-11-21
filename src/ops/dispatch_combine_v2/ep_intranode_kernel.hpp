@@ -424,6 +424,19 @@ __device__ void EpDispatchBody(EpArgs args) {
 // constants, so EpLl* fix how many rows each warp takes and the compiler unrolls the
 // row loop to exactly that.
 
+// The peer payload store, told it is global. EpPeer<T>() builds its pointer by casting an
+// integer (winBase + peer stride + offset), so the compiler cannot see address space 1 and
+// falls back to flat_store_dwordx4 -- which on gfx9 cannot use the SADDR form and is checked
+// against the LDS aperture, while the matching load, whose source is a plain host pointer,
+// gets global_load_dwordx4 ... nt. Naming the space restores the global form and the hint.
+template <typename V>
+__device__ __forceinline__ void EpGlobalStore16(void* addr, V v) {
+  using G64 = __attribute__((address_space(1))) unsigned long long;
+  G64* p = reinterpret_cast<G64*>(addr);
+  __builtin_nontemporal_store(v.x, p);
+  __builtin_nontemporal_store(v.y, p + 1);
+}
+
 template <int kMaxDests>
 struct EpLlRoute {
   int numDests;
@@ -671,7 +684,7 @@ __device__ void EpDispatchLLBody(EpArgs args) {
                 bool live = kRowsAlwaysLive || row < rowCount;
                 if constexpr (kPartialRow)
                   live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLlLastRowVecs(kCfg));
-                if (live) core::store<16>(dst + row * kRowBytes + laneOff, v[u]);
+                if (live) EpGlobalStore16(dst + row * kRowBytes + laneOff, v[u]);
               }
             }
           }
