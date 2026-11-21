@@ -625,11 +625,17 @@ __device__ void EpDispatchLLBody(EpArgs args) {
             const int rank = __builtin_amdgcn_readfirstlane(route.destRank[d]);
             const int slot = __builtin_amdgcn_readfirstlane(route.recvSlot[d]);
             if (laneId < kTopk) {
+              // PROBE: the metadata stores, done twice. The receiver reads these only
+              // after the tail's signal, so writing the same values again is invisible
+              // to it -- the cost is one more pair of partial-line peer writes a
+              // destination, which is what this probe prices.
               if constexpr (kCfg.useWeights) {
                 if (args.weightsBuf) {
                   EpPeer<float>(win, rank, args.offOutWts)[slot * kTopk + laneId] = wt;
+                  EpPeer<float>(win, rank, args.offOutWts)[slot * kTopk + laneId] = wt;
                 }
               }
+              EpPeer<int>(win, rank, args.offOutIdx)[slot * kTopk + laneId] = idx;
               EpPeer<int>(win, rank, args.offOutIdx)[slot * kTopk + laneId] = idx;
             }
           }
