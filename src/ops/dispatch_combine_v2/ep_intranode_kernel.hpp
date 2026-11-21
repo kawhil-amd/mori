@@ -269,6 +269,11 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
       const int numTokenSignal = __hip_atomic_load(args.destPeTokenCounter + destPe,
                                                    __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) +
                                  1;
+      // PROBE: the fence + signal store, done twice. Storing the same value again is
+      // idempotent for the reader (it waits for > 0), so the extra pass is pure cost.
+      __threadfence_system();
+      __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
+                         __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
       __threadfence_system();
       __hip_atomic_store(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, numTokenSignal,
                          __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
