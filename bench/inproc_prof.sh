@@ -10,7 +10,7 @@ chmod +x $O/w.sh
 cd /sgl-workspace/mori/tests/python/ops/dispatch_combine_v2
 env PYTHONPATH=/sgl-workspace/mori/python MORI_SOURCE_ROOT=/sgl-workspace/mori \
     MORI_V2_LIB_DIR=/sgl-workspace/mori/python/mori \
-    BACKENDS=${BK:-hip,hip_ll} COMB_MODE=pull SWEEP=${SW:-1,32,128,4096} ITERS=200 WARMUP=20 MODES=graph CHECK=0 \
+    BACKENDS=${BK:-hip,hip_ll} COMB_MODE=pull SWEEP=${SW:-1,32,128,4096} ITERS=${IT:-200} WARMUP=20 MODES=graph CHECK=0 \
     python3 -m torch.distributed.run --standalone --nproc_per_node=8 --no-python $O/w.sh python3 bench_ep.py > $O/log 2>&1 || true
 python3 - <<'K'
 import csv,statistics as st,collections
