@@ -253,6 +253,11 @@ __device__ __forceinline__ void EpDispatchNotify(EpArgs args) {
 
   unsigned drainTicket = kNoTicket;
   if (isFirstArriver) {
+    // PROBE: the drain read, done twice. Re-reading a slot that is already zero is
+    // idempotent, so the extra pass costs exactly one more peer round trip.
+    for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
+      EpWaitEq(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, 0);
+    }
     for (int destPe = laneId; destPe < kNpes; destPe += kCfg.waveSize) {
       EpWaitEq(EpPeer<int>(win, destPe, args.offRecvNum) + myPe, 0);
     }
