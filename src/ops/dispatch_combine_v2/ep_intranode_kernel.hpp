@@ -432,7 +432,9 @@ __device__ void EpDispatchBody(EpArgs args) {
 template <typename V>
 __device__ __forceinline__ void EpGlobalStore16(void* addr, V v) {
   using G64 = __attribute__((address_space(1))) unsigned long long;
-  G64* p = reinterpret_cast<G64*>(addr);
+  // void* is generic (address space 0) and a reinterpret_cast cannot change the space, so
+  // rebuild the pointer from the integer EpPeer<T>() computed it from in the first place.
+  G64* p = (G64*)(uintptr_t)addr;
   __builtin_nontemporal_store(v.x, p);
   __builtin_nontemporal_store(v.y, p + 1);
 }
