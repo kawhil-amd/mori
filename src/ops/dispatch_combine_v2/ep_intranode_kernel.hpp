@@ -577,6 +577,10 @@ __device__ void EpDispatchBody(EpArgs args) {
   // Tokens per iteration: iteration s of the block's loop owns tokens
   // [s * kT, s * kT + kT), and copy warp group `sub` copies token s * kT + sub.
   constexpr int kT = EpTokPerIter(kCfg);
+  // dispTokShareWarps: no warp groups -- every copy warp copies its rows of all kT
+  // tokens, loading all of them before it stores any.
+  constexpr bool kShare = kCfg.dispTokShareWarps && kT > 1;
+  constexpr int kPreT = kShare ? kT : 1;
 
   const int thdId = threadIdx.x;
   const int laneId = thdId & (kCfg.waveSize - 1);
@@ -590,12 +594,12 @@ __device__ void EpDispatchBody(EpArgs args) {
   __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2][kT];
 
   const int copyAll = warpId - kCtrl;
-  const int sub = kT == 1 || copyAll < 0 ? 0 : copyAll / kCopyWarps;
-  const int copyWarp = kT == 1 || copyAll < 0 ? copyAll : copyAll % kCopyWarps;
+  const int sub = kT == 1 || kShare || copyAll < 0 ? 0 : copyAll / kCopyWarps;
+  const int copyWarp = kT == 1 || kShare || copyAll < 0 ? copyAll : copyAll % kCopyWarps;
   const int rowCount = kEvenRows ? kRows / kCopyWarps : EpRowCount(kCfg, copyWarp);
   const int rowBegin = EpRowBegin(kCfg, copyWarp);
   const size_t laneOff = static_cast<size_t>(laneId) * 16;
-  Vec pre[kChunk];
+  Vec pre[kPreT][kChunk];
 
   if (args.tokenIndices && args.inpTokenBuf) {
     // Prologue: warp 0 routes the first token this block owns -- a remote atomic a
@@ -612,15 +616,19 @@ __device__ void EpDispatchBody(EpArgs args) {
       EpDispatchRouteIter<kCfg>(args, blockIdx.x * kT, numTokens, routeBuf[0], nextDid, nextSlotK,
                                 nextSlot);
     } else if (warpId >= kCtrl && firstTok < numTokens && rowCount > 0) {
-      const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
-                           static_cast<size_t>(firstTok) * kTokBytes +
-                           static_cast<size_t>(rowBegin) * kRowBytes;
 #pragma unroll
-      for (int u = 0; u < kChunk; ++u) {
-        bool live = kRowsAlwaysLive || u < rowCount;
-        if constexpr (kPartialRow)
-          live = live && !(rowBegin + u == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
-        if (live) pre[u] = core::load<16>(src + u * kRowBytes + laneOff);
+      for (int j = 0; j < kPreT; ++j) {
+        if (firstTok + j >= numTokens) continue;
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
+                             static_cast<size_t>(firstTok + j) * kTokBytes +
+                             static_cast<size_t>(rowBegin) * kRowBytes;
+#pragma unroll
+        for (int u = 0; u < kChunk; ++u) {
+          bool live = kRowsAlwaysLive || u < rowCount;
+          if constexpr (kPartialRow)
+            live = live && !(rowBegin + u == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+          if (live) pre[j][u] = core::load<16>(src + u * kRowBytes + laneOff);
+        }
       }
     }
     __syncthreads();
@@ -667,6 +675,86 @@ __device__ void EpDispatchBody(EpArgs args) {
                 for (int i = 0; i < kIters; ++i) {
                   const int e = laneId + i * kCfg.waveSize;
                   if (e < kDstDw) dst[e] = v[i];
+                }
+              }
+            }
+          }
+        }
+      } else if constexpr (kShare) {
+        // Every copy warp, all kT tokens: metadata a destination to a copy warp as
+        // below, per token; then this warp's rows of every token are loaded before
+        // any is stored, so kT tokens' loads are in flight together.
+#pragma unroll
+        for (int j = 0; j < kT; ++j) {
+          const auto& rj = routeBuf[pingPong][j];
+          const int nd = rj.numDests;
+          if (nd > 0) {
+            const int srcTok = rj.srcTok;
+            float wt = 0.0f;
+            int idx = 0;
+            if (laneId < kTopk) {
+              if constexpr (kCfg.useWeights) {
+                if (args.weightsBuf) wt = args.weightsBuf[srcTok * kTopk + laneId];
+              }
+              idx = args.tokenIndices[srcTok * kTopk + laneId];
+            }
+            for (int d = copyWarp; d < nd; d += kCopyWarps) {
+              const int rank = __builtin_amdgcn_readfirstlane(rj.destRank[d]);
+              const int slot = __builtin_amdgcn_readfirstlane(rj.recvSlot[d]);
+              if (laneId < kTopk) {
+                if constexpr (kCfg.useWeights) {
+                  if (args.weightsBuf) {
+                    EpPeer<float>(win, rank, args.offOutWts)[slot * kTopk + laneId] = wt;
+                  }
+                }
+                EpPeer<int>(win, rank, args.offOutIdx)[slot * kTopk + laneId] = idx;
+              }
+            }
+          }
+        }
+        if (rowCount > 0) {
+          const bool pre_ok = iter == blockIdx.x;
+          for (int c0 = 0; c0 < rowCount; c0 += kChunk) {
+            Vec v[kT][kChunk];
+#pragma unroll
+            for (int j = 0; j < kT; ++j) {
+              const auto& rj = routeBuf[pingPong][j];
+              if (rj.numDests <= 0) continue;
+              const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
+                                   static_cast<size_t>(rj.srcTok) * kTokBytes +
+                                   static_cast<size_t>(rowBegin) * kRowBytes;
+#pragma unroll
+              for (int u = 0; u < kChunk; ++u) {
+                const int row = c0 + u;
+                bool live = kRowsAlwaysLive || row < rowCount;
+                if constexpr (kPartialRow)
+                  live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+                if (live)
+                  v[j][u] = (pre_ok && c0 == 0) ? pre[j][u]
+                                                : core::load<16>(src + row * kRowBytes + laneOff);
+              }
+            }
+#pragma unroll
+            for (int j = 0; j < kT; ++j) {
+              const auto& rj = routeBuf[pingPong][j];
+              const int nd = rj.numDests;
+              if (nd <= 0) continue;
+              uint8_t* dstReg = nullptr;
+              if (laneId < nd) {
+                const int di = (copyWarp & 1) ? nd - 1 - laneId : laneId;
+                dstReg = EpPeer<uint8_t>(win, rj.destRank[di], args.offDispOut) +
+                         static_cast<size_t>(rj.recvSlot[di]) * kTokBytes +
+                         static_cast<size_t>(rowBegin) * kRowBytes;
+              }
+              for (int d = 0; d < nd; ++d) {
+                uint8_t* dst = EpReadLanePtr(dstReg, d);
+#pragma unroll
+                for (int u = 0; u < kChunk; ++u) {
+                  const int row = c0 + u;
+                  bool live = kRowsAlwaysLive || row < rowCount;
+                  if constexpr (kPartialRow)
+                    live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
+                  if (live) core::store<16>(dst + row * kRowBytes + laneOff, v[j][u]);
                 }
               }
             }
@@ -729,8 +817,8 @@ __device__ void EpDispatchBody(EpArgs args) {
               if constexpr (kPartialRow)
                 live = live && !(rowBegin + row == kRows - 1 && laneId >= EpLastRowVecs(kCfg));
               if (live)
-                v[u] =
-                    (pre_ok && c0 == 0) ? pre[u] : core::load<16>(src + row * kRowBytes + laneOff);
+                v[u] = (pre_ok && c0 == 0) ? pre[0][u]
+                                           : core::load<16>(src + row * kRowBytes + laneOff);
             }
             for (int d = 0; d < numDests; ++d) {
               uint8_t* dst = EpReadLanePtr(dstReg, d);

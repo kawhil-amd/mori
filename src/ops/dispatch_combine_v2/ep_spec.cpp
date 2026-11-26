@@ -156,9 +156,10 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
             " topk=" + std::to_string(c.numExpertPerToken) + ")");
       }
       c.dispTokPerIter = t;
+      c.dispTokShareWarps = req.dispTokShareWarps;
     }
     if (req.warpPerBlock <= 0) c.warpPerBlock = EpDefaultDispatchWarps(c);
-    if ((c.warpPerBlock - EpCtrlWarps(c)) % EpTokPerIter(c) != 0) {
+    if ((c.warpPerBlock - EpCtrlWarps(c)) % EpTokWarpGroups(c) != 0) {
       throw std::runtime_error(
           "mori v2 ep: the dispatch's copy warps (warps=" + std::to_string(c.warpPerBlock) +
           " minus the control warps) must split evenly over "
@@ -302,7 +303,10 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   s += "_h" + std::to_string(cfg.hiddenDim);
   s += "_k" + std::to_string(cfg.numExpertPerToken);
   s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
-  if (EpTokPerIter(cfg) > 1) s += "_t" + std::to_string(EpTokPerIter(cfg));
+  if (EpTokPerIter(cfg) > 1) {
+    s += "_t" + std::to_string(EpTokPerIter(cfg));
+    if (cfg.dispTokShareWarps) s += 's';
+  }
   return s;
 }
 

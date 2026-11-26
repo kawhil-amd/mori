@@ -1187,6 +1187,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         )
         if cfg.dispatch_tok_per_iter > 1 and not self._is1250:
             disp["disp_tok_per_iter"] = int(cfg.dispatch_tok_per_iter)
+            if cfg.dispatch_tok_share_warps:
+                disp["disp_tok_share_warps"] = True
         if self._card is not None:
             disp["card_dedup"] = True
             disp["card_combine"] = True

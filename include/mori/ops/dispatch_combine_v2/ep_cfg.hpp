@@ -278,6 +278,11 @@ struct EpCfg {
   // and warp 0 routes all T in one pass (a wave segment a token). 0 and 1 are both
   // one token, and 0 keeps the Cfg text of a build without this field.
   int dispTokPerIter = 0;
+  // With dispTokPerIter > 1: every copy warp copies its rows of ALL T tokens
+  // (loads for all T first, then the stores) instead of T warp groups a token each.
+  // The block keeps the one-token warp count; the T tokens add memory-level
+  // parallelism inside each warp rather than more warps.
+  bool dispTokShareWarps = false;
 };
 
 template <typename Self, typename Visit>
@@ -313,10 +318,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(cardCombine);
   MORI_FIELD(ll128Dedup);
   MORI_FIELD(dispTokPerIter);
+  MORI_FIELD(dispTokShareWarps);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 30, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 31, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -407,9 +413,12 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // ---------------------------------------------------------------------------
 constexpr int EpCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
 constexpr int EpTokPerIter(const EpCfg& c) { return c.dispTokPerIter > 1 ? c.dispTokPerIter : 1; }
-// Copy warps PER TOKEN: the block's copy warps are split evenly over its T tokens.
+// Warp groups a token: T when the T tokens of an iteration have a copy warp group
+// each, 1 when every copy warp serves all T (dispTokShareWarps).
+constexpr int EpTokWarpGroups(const EpCfg& c) { return c.dispTokShareWarps ? 1 : EpTokPerIter(c); }
+// Copy warps PER TOKEN.
 constexpr int EpCopyWarps(const EpCfg& c) {
-  return (c.warpPerBlock - EpCtrlWarps(c)) / EpTokPerIter(c);
+  return (c.warpPerBlock - EpCtrlWarps(c)) / EpTokWarpGroups(c);
 }
 constexpr int EpRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
 constexpr int EpRowsPerToken(const EpCfg& c) {
@@ -445,10 +454,10 @@ constexpr int EpMaxDests(const EpCfg& c) {
 // the single-constant row count.
 constexpr int EpDefaultDispatchWarps(const EpCfg& c) {
   // EpBlockThreads(c) <= 1024, shared by the T tokens of an iteration.
-  const int cap = (1024 / c.waveSize - EpCtrlWarps(c)) / EpTokPerIter(c);
+  const int cap = (1024 / c.waveSize - EpCtrlWarps(c)) / EpTokWarpGroups(c);
   const int rows = EpRowsPerToken(c);
   const int copy = rows < cap ? rows : cap;
-  return EpCtrlWarps(c) + EpTokPerIter(c) * (copy > 0 ? copy : 1);
+  return EpCtrlWarps(c) + EpTokWarpGroups(c) * (copy > 0 ? copy : 1);
 }
 
 constexpr int EpCombinePushSlotAlign = 128;

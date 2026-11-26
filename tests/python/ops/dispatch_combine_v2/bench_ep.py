@@ -304,10 +304,12 @@ def main():
 
     def build(backend):
         # Bench-only pseudo-backends: "hip_t2" = hip with 2 tokens per dispatch
-        # iteration; "@B" pins the dispatch block count (hip_t2@256).
+        # iteration, "hip_t2s" with the copy warps shared by them; "@B" pins the
+        # dispatch block count (hip_t2@256).
         name, _, blocks = backend.partition("@")
-        tok_per_iter = int(name.split("_t")[1]) if "_t" in name else 1
-        kernel = name.split("_t")[0]
+        kernel, _, tsuf = name.partition("_t")
+        share = tsuf.endswith("s")
+        tok_per_iter = int(tsuf.rstrip("s")) if tsuf else 1
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=world,
@@ -323,6 +325,7 @@ def main():
             kernel_backend=kernel,
             dispatch_block_num=int(blocks) if blocks else _G["DBN"],
             dispatch_tok_per_iter=tok_per_iter,
+            dispatch_tok_share_warps=share,
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],

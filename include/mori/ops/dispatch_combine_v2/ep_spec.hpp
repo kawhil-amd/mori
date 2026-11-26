@@ -70,7 +70,8 @@ struct EpRequest {
   bool cardFwdMark = false;
   bool cardCombine = false;
   bool ll128Dedup = false;
-  int dispTokPerIter = 0;  // dispatch: tokens a block takes per iteration; 0 = 1
+  int dispTokPerIter = 0;          // dispatch: tokens a block takes per iteration; 0 = 1
+  bool dispTokShareWarps = false;  // ... and every copy warp serves all of them
 };
 
 template <typename Self, typename Visit>
@@ -105,10 +106,11 @@ inline void VisitFields(Self& r, const EpRequest& d, Visit&& v) {
   MORI_FIELD(cardCombine);
   MORI_FIELD(ll128Dedup);
   MORI_FIELD(dispTokPerIter);
+  MORI_FIELD(dispTokShareWarps);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 29,
+MORI_JIT_ASSERT_FIELD_COUNT(EpRequest, 30,
                             "added an EpRequest field -- update VisitFields(EpRequest) too");
 
 std::string EpRequestSchema();

@@ -171,6 +171,8 @@ class EpDispatchCombineConfig:
     # hip intranode dispatch (not gfx125x): tokens a block takes per loop iteration,
     # 1, 2 or 4. More than one helps a token with few rows (fp4).
     dispatch_tok_per_iter: int = 1
+    # ... and every copy warp serves all of them, instead of a warp group a token.
+    dispatch_tok_share_warps: bool = False
     # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
     # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
     # distinct (block, warp) variants and picks one at runtime from
