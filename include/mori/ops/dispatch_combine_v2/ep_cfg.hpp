@@ -272,6 +272,12 @@ struct EpCfg {
   bool cardFwdMark = false;
   bool cardCombine = false;
   bool ll128Dedup = false;
+  // Intranode dispatch (not gfx125x): tokens a block takes per loop iteration. A
+  // short token (fp4: 3-4 rows) leaves a block a handful of copy warps; taking T
+  // adjacent tokens gives it T times the copy warps and one barrier per T tokens,
+  // and warp 0 routes all T in one pass (a wave segment a token). 0 and 1 are both
+  // one token, and 0 keeps the Cfg text of a build without this field.
+  int dispTokPerIter = 0;
 };
 
 template <typename Self, typename Visit>
@@ -306,10 +312,11 @@ inline void VisitFields(Self& c, const EpCfg& d, Visit&& v) {
   MORI_FIELD(cardFwdMark);
   MORI_FIELD(cardCombine);
   MORI_FIELD(ll128Dedup);
+  MORI_FIELD(dispTokPerIter);
 #undef MORI_FIELD
 }
 
-MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 29, "added an EpCfg field -- update VisitFields(EpCfg) too");
+MORI_JIT_ASSERT_FIELD_COUNT(EpCfg, 30, "added an EpCfg field -- update VisitFields(EpCfg) too");
 
 inline std::string Render(const EpCfg& c) {
   const EpCfg d{};
@@ -399,7 +406,11 @@ constexpr int EpTokenBytes(const EpCfg& c) { return c.hiddenDim * EpElemSize(c.d
 // offset is computed on the device.
 // ---------------------------------------------------------------------------
 constexpr int EpCtrlWarps(const EpCfg& c) { return c.scaleBytes > 0 ? 2 : 1; }
-constexpr int EpCopyWarps(const EpCfg& c) { return c.warpPerBlock - EpCtrlWarps(c); }
+constexpr int EpTokPerIter(const EpCfg& c) { return c.dispTokPerIter > 1 ? c.dispTokPerIter : 1; }
+// Copy warps PER TOKEN: the block's copy warps are split evenly over its T tokens.
+constexpr int EpCopyWarps(const EpCfg& c) {
+  return (c.warpPerBlock - EpCtrlWarps(c)) / EpTokPerIter(c);
+}
 constexpr int EpRowBytes(const EpCfg& c) { return 16 * c.waveSize; }
 constexpr int EpRowsPerToken(const EpCfg& c) {
   return (EpTokenBytes(c) + EpRowBytes(c) - 1) / EpRowBytes(c);
@@ -433,10 +444,11 @@ constexpr int EpMaxDests(const EpCfg& c) {
 // spreads the remainder; one row a warp is exactly even, so the common shapes also get
 // the single-constant row count.
 constexpr int EpDefaultDispatchWarps(const EpCfg& c) {
-  const int cap = 1024 / c.waveSize - EpCtrlWarps(c);  // EpBlockThreads(c) <= 1024
+  // EpBlockThreads(c) <= 1024, shared by the T tokens of an iteration.
+  const int cap = (1024 / c.waveSize - EpCtrlWarps(c)) / EpTokPerIter(c);
   const int rows = EpRowsPerToken(c);
   const int copy = rows < cap ? rows : cap;
-  return EpCtrlWarps(c) + (copy > 0 ? copy : 1);
+  return EpCtrlWarps(c) + EpTokPerIter(c) * (copy > 0 ? copy : 1);
 }
 
 constexpr int EpCombinePushSlotAlign = 128;

@@ -431,6 +431,135 @@ __device__ __forceinline__ void EpDispatchRoute(const EpArgs& args, int tokenId,
   }
 }
 
+// dispTokPerIter > 1: warp 0 routes tokens [tokenBase, tokenBase + T) in ONE pass.
+// The wave is cut into T segments of W = waveSize / T lanes; segment j is token
+// tokenBase + j, and lane p of it plays the part lane p plays in the one-token
+// routes above. All T tokens' remote slot claims are then in flight together, so
+// the iteration pays one atomic round trip, not T. A token past numTokens gets an
+// empty route. didAlloc / slotForMe / mySlot mean what they mean above, per lane.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchRouteSeg(const EpArgs& args, int tokenBase, int numTokens,
+                                                   EpRoute<EpMaxDests(kCfg)>* routes, int& didAlloc,
+                                                   int& slotForMe, int& mySlot) {
+  constexpr int kT = EpTokPerIter(kCfg);
+  constexpr int kW = kCfg.waveSize / kT;
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  constexpr int kNpes = kCfg.worldSize;
+  static_assert(kT > 1 && kNpes <= kW && kTopk <= kW, "MakeEpCfg checks the segment fits");
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  const int seg = laneId / kW;
+  const int p = laneId % kW;
+  const int tokenId = tokenBase + seg;
+  const bool live = tokenId < numTokens;
+  EpRoute<EpMaxDests(kCfg)>& route = routes[seg];
+
+  route.srcTok = tokenId;
+  didAlloc = 0;
+  mySlot = 0;
+  slotForMe = -1;
+
+  if constexpr (kCfg.replay) {
+    if (live && p < kTopk) {
+      const int flat = args.dispDestTokIdMap[tokenId * kTopk + p];
+      const int pe = EpPeFromFlat<kCfg>(flat);
+      if (flat >= 0 && pe < kNpes) {
+        didAlloc = 1;
+        slotForMe = pe;  // replay: the decoded rank, as EpDispatchReplayRoute's destPe
+        mySlot = EpLocalTokFromFlat<kCfg>(flat);
+      }
+    }
+  } else {
+    int targetPe = -1;
+    if (live && p < kTopk) {
+      const int expert = args.tokenIndices[tokenId * kTopk + p];
+      const int pe = expert >= 0 ? expert / kCfg.numExpertPerRank : -1;
+      targetPe = pe < kNpes ? pe : -1;
+    }
+    // readlane wants a uniform lane, so read slot k of every segment and keep this
+    // lane's own: T readlanes a slot instead of one, all scalar.
+#pragma unroll
+    for (int k = kTopk - 1; k >= 0; --k) {
+      int peK = __builtin_amdgcn_readlane(targetPe, k);
+#pragma unroll
+      for (int j = 1; j < kT; ++j) {
+        const int peJ = __builtin_amdgcn_readlane(targetPe, j * kW + k);
+        peK = seg == j ? peJ : peK;
+      }
+      slotForMe = (peK == p) ? k : slotForMe;
+    }
+    if (slotForMe >= 0) {
+      didAlloc = 1;
+      mySlot = __hip_atomic_fetch_add(EpPeer<int>(args.window, p, args.offTokOff), 1,
+                                      __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+      if constexpr (EpRecvCapped(kCfg)) {
+        if (mySlot >= EpMaxRecv(kCfg)) didAlloc = 0;
+      }
+    }
+  }
+
+  const unsigned long long active = __ballot(didAlloc);
+  const unsigned long long segMask = ((1ull << kW) - 1) << (seg * kW);
+  if (didAlloc) {
+    const int pos = __popcll(active & segMask & ((1ull << laneId) - 1));
+    route.destRank[pos] = kCfg.replay ? slotForMe : p;
+    route.recvSlot[pos] = mySlot;
+  }
+  if (p == 0) route.numDests = __popcll(active & segMask);
+}
+
+// EpDispatchWriteMap for the T tokens EpDispatchRouteSeg routed.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchWriteMapSeg(const EpArgs& args, int tokenBase,
+                                                      int numTokens, int didAlloc, int slotForMe,
+                                                      int mySlot) {
+  constexpr int kT = EpTokPerIter(kCfg);
+  constexpr int kW = kCfg.waveSize / kT;
+  constexpr int kTopk = kCfg.numExpertPerToken;
+  const int laneId = threadIdx.x & (kCfg.waveSize - 1);
+  const int seg = laneId / kW;
+  const int p = laneId % kW;
+  const int tokenId = tokenBase + seg;
+
+  const int destPe = kCfg.replay ? slotForMe : p;
+  if constexpr (!kCfg.replay) {
+    if (tokenId < numTokens && p < kTopk)
+      args.dispDestTokIdMap[tokenId * kTopk + p] = EpNullFlat<kCfg>();
+  }
+  if (didAlloc) {
+    atomicAdd(args.destPeTokenCounter + destPe, 1);
+    EpPeer<int>(args.window, destPe, args.offRecvToSrc)[mySlot] =
+        EpSrcTokIndex<kCfg>(args.rank, tokenId);
+    if constexpr (!kCfg.replay) {
+      args.dispDestTokIdMap[tokenId * kTopk + slotForMe] = EpFlatIndex<kCfg>(p, mySlot);
+    }
+  }
+}
+
+// Route and map the T tokens starting at tokenBase. T == 1 is the one-token path
+// unchanged, so its code is what it was before dispTokPerIter existed.
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchRouteIter(const EpArgs& args, int tokenBase,
+                                                    int numTokens,
+                                                    EpRoute<EpMaxDests(kCfg)>* routes,
+                                                    int& didAlloc, int& slotForMe, int& mySlot) {
+  if constexpr (EpTokPerIter(kCfg) == 1) {
+    EpDispatchRoute<kCfg>(args, tokenBase, routes[0], didAlloc, slotForMe, mySlot);
+  } else {
+    EpDispatchRouteSeg<kCfg>(args, tokenBase, numTokens, routes, didAlloc, slotForMe, mySlot);
+  }
+}
+
+template <EpCfg kCfg>
+__device__ __forceinline__ void EpDispatchWriteMapIter(const EpArgs& args, int tokenBase,
+                                                       int numTokens, int didAlloc, int slotForMe,
+                                                       int mySlot) {
+  if constexpr (EpTokPerIter(kCfg) == 1) {
+    EpDispatchWriteMap<kCfg>(args, tokenBase, didAlloc, slotForMe, mySlot);
+  } else {
+    EpDispatchWriteMapSeg<kCfg>(args, tokenBase, numTokens, didAlloc, slotForMe, mySlot);
+  }
+}
+
 template <EpCfg kCfg, typename T>
 __device__ void EpDispatchBody(EpArgs args) {
   constexpr int kTopk = kCfg.numExpertPerToken;
@@ -445,18 +574,24 @@ __device__ void EpDispatchBody(EpArgs args) {
   constexpr int kChunk = kMaxRows < 4 ? kMaxRows : 4;
   // No warp has a short chunk: every row of every chunk exists.
   constexpr bool kRowsAlwaysLive = kEvenRows && (kMaxRows % kChunk) == 0;
+  // Tokens per iteration: iteration s of the block's loop owns tokens
+  // [s * kT, s * kT + kT), and copy warp group `sub` copies token s * kT + sub.
+  constexpr int kT = EpTokPerIter(kCfg);
 
   const int thdId = threadIdx.x;
   const int laneId = thdId & (kCfg.waveSize - 1);
   const int warpId = thdId / kCfg.waveSize;
   const unsigned long long win = args.window;
   const int numTokens = args.numTokens;
+  const int numIters = (numTokens + kT - 1) / kT;
 
   using Vec = typename core::VecTypeSelector<16>::dataType;
 
-  __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2];
+  __shared__ EpRoute<EpMaxDests(kCfg)> routeBuf[2][kT];
 
-  const int copyWarp = warpId - kCtrl;
+  const int copyAll = warpId - kCtrl;
+  const int sub = kT == 1 || copyAll < 0 ? 0 : copyAll / kCopyWarps;
+  const int copyWarp = kT == 1 || copyAll < 0 ? copyAll : copyAll % kCopyWarps;
   const int rowCount = kEvenRows ? kRows / kCopyWarps : EpRowCount(kCfg, copyWarp);
   const int rowBegin = EpRowBegin(kCfg, copyWarp);
   const size_t laneOff = static_cast<size_t>(laneId) * 16;
@@ -472,11 +607,13 @@ __device__ void EpDispatchBody(EpArgs args) {
     // atomic's latency is spent on them. Where a block holds one token -- every call
     // with no more tokens than blocks -- this prologue IS the kernel.
     int nextDid = 0, nextSlotK = -1, nextSlot = 0;
-    if (warpId == 0 && blockIdx.x < numTokens) {
-      EpDispatchRoute<kCfg>(args, blockIdx.x, routeBuf[0], nextDid, nextSlotK, nextSlot);
-    } else if (warpId >= kCtrl && blockIdx.x < numTokens && rowCount > 0) {
+    const int firstTok = blockIdx.x * kT + sub;
+    if (warpId == 0 && blockIdx.x < numIters) {
+      EpDispatchRouteIter<kCfg>(args, blockIdx.x * kT, numTokens, routeBuf[0], nextDid, nextSlotK,
+                                nextSlot);
+    } else if (warpId >= kCtrl && firstTok < numTokens && rowCount > 0) {
       const uint8_t* src = reinterpret_cast<const uint8_t*>(args.inpTokenBuf) +
-                           static_cast<size_t>(blockIdx.x) * kTokBytes +
+                           static_cast<size_t>(firstTok) * kTokBytes +
                            static_cast<size_t>(rowBegin) * kRowBytes;
 #pragma unroll
       for (int u = 0; u < kChunk; ++u) {
@@ -487,45 +624,50 @@ __device__ void EpDispatchBody(EpArgs args) {
       }
     }
     __syncthreads();
-    if (warpId == 0 && blockIdx.x < numTokens) {
-      EpDispatchWriteMap<kCfg>(args, blockIdx.x, nextDid, nextSlotK, nextSlot);
+    if (warpId == 0 && blockIdx.x < numIters) {
+      EpDispatchWriteMapIter<kCfg>(args, blockIdx.x * kT, numTokens, nextDid, nextSlotK, nextSlot);
     }
 
-    for (int tokenIdx = blockIdx.x; tokenIdx < numTokens; tokenIdx += gridDim.x) {
-      const int pingPong = (tokenIdx / gridDim.x) & 1;
-      const auto& route = routeBuf[pingPong];
+    for (int iter = blockIdx.x; iter < numIters; iter += gridDim.x) {
+      const int pingPong = (iter / gridDim.x) & 1;
+      const auto& route = routeBuf[pingPong][sub];
 
       if (warpId == 0) {
-        const int nextTok = tokenIdx + gridDim.x;
-        if (nextTok < numTokens) {
-          EpDispatchRoute<kCfg>(args, nextTok, routeBuf[1 - pingPong], nextDid, nextSlotK,
-                                nextSlot);
-          EpDispatchWriteMap<kCfg>(args, nextTok, nextDid, nextSlotK, nextSlot);
+        const int nextIter = iter + gridDim.x;
+        if (nextIter < numIters) {
+          EpDispatchRouteIter<kCfg>(args, nextIter * kT, numTokens, routeBuf[1 - pingPong], nextDid,
+                                    nextSlotK, nextSlot);
+          EpDispatchWriteMapIter<kCfg>(args, nextIter * kT, numTokens, nextDid, nextSlotK,
+                                       nextSlot);
         }
       } else if (kCfg.scaleBytes > 0 && warpId == 1) {
         if constexpr (kCfg.scaleBytes > 0) {
           constexpr int kSrcDw = kCfg.scaleBytes / 4;
           constexpr int kDstDw = EpScaleStride(kCfg) / 4;
           constexpr int kIters = (kDstDw + kCfg.waveSize - 1) / kCfg.waveSize;
-          const int numDests = route.numDests;
-          if (numDests > 0 && args.scalesBuf) {
-            const unsigned int* src = reinterpret_cast<const unsigned int*>(args.scalesBuf) +
-                                      static_cast<size_t>(route.srcTok) * kSrcDw;
-            unsigned int v[kIters];
 #pragma unroll
-            for (int i = 0; i < kIters; ++i) {
-              const int e = laneId + i * kCfg.waveSize;
-              v[i] = e < kSrcDw ? src[e] : 0u;
-            }
-            for (int d = 0; d < numDests; ++d) {
-              const int rank = __builtin_amdgcn_readfirstlane(route.destRank[d]);
-              const int slot = __builtin_amdgcn_readfirstlane(route.recvSlot[d]);
-              unsigned int* dst = EpPeer<unsigned int>(win, rank, args.offOutScales) +
-                                  static_cast<size_t>(slot) * kDstDw;
+          for (int j = 0; j < kT; ++j) {
+            const auto& route = routeBuf[pingPong][j];
+            const int numDests = route.numDests;
+            if (numDests > 0 && args.scalesBuf) {
+              const unsigned int* src = reinterpret_cast<const unsigned int*>(args.scalesBuf) +
+                                        static_cast<size_t>(route.srcTok) * kSrcDw;
+              unsigned int v[kIters];
 #pragma unroll
               for (int i = 0; i < kIters; ++i) {
                 const int e = laneId + i * kCfg.waveSize;
-                if (e < kDstDw) dst[e] = v[i];
+                v[i] = e < kSrcDw ? src[e] : 0u;
+              }
+              for (int d = 0; d < numDests; ++d) {
+                const int rank = __builtin_amdgcn_readfirstlane(route.destRank[d]);
+                const int slot = __builtin_amdgcn_readfirstlane(route.recvSlot[d]);
+                unsigned int* dst = EpPeer<unsigned int>(win, rank, args.offOutScales) +
+                                    static_cast<size_t>(slot) * kDstDw;
+#pragma unroll
+                for (int i = 0; i < kIters; ++i) {
+                  const int e = laneId + i * kCfg.waveSize;
+                  if (e < kDstDw) dst[e] = v[i];
+                }
               }
             }
           }
@@ -576,7 +718,7 @@ __device__ void EpDispatchBody(EpArgs args) {
                                static_cast<size_t>(route.srcTok) * kTokBytes +
                                static_cast<size_t>(rowBegin) * kRowBytes;
           // The prologue already read chunk 0 of this block's first token.
-          bool pre_ok = tokenIdx == blockIdx.x;
+          bool pre_ok = iter == blockIdx.x;
 
           for (int c0 = 0; c0 < rowCount; c0 += kChunk) {
             Vec v[kChunk];

@@ -1185,6 +1185,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # rejects a Cfg whose row is not a whole number of them.
             scale_bytes=self._scale_i32(cfg) * 4,
         )
+        if cfg.dispatch_tok_per_iter > 1 and not self._is1250:
+            disp["disp_tok_per_iter"] = int(cfg.dispatch_tok_per_iter)
         if self._card is not None:
             disp["card_dedup"] = True
             disp["card_combine"] = True

@@ -168,6 +168,9 @@ class EpDispatchCombineConfig:
     combine_block_num: int = None
     warp_num_per_block: int = None
     combine_warp_num_per_block: int = None
+    # hip intranode dispatch (not gfx125x): tokens a block takes per loop iteration,
+    # 1, 2 or 4. More than one helps a token with few rows (fp4).
+    dispatch_tok_per_iter: int = 1
     # Optional per-token plan: tuple of (max_tok_inclusive | None, disp_block,
     # disp_warp, comb_block, comb_warp) buckets. When set, the op precompiles the
     # distinct (block, warp) variants and picks one at runtime from

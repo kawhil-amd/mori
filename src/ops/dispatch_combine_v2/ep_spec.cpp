@@ -143,7 +143,28 @@ EpCfg MakeEpCfg(const std::string& arch, const EpRequest& req, EpKernelKind kind
   // its constraints are checked here -- EpCfgIsValid cannot tell a dispatch from a
   // combine, and worldSize <= waveSize is true of the first and not of the second.
   if (isDispatch && arch.rfind("gfx125", 0) != 0) {
+    if (req.dispTokPerIter > 1) {
+      // Warp 0 routes the T tokens in one pass, a wave segment of waveSize / T lanes
+      // each, so both a token's topk slots and the world must fit in a segment.
+      const int t = req.dispTokPerIter;
+      const int seg = c.waveSize / t;
+      if ((t != 2 && t != 4) || c.worldSize > seg || c.numExpertPerToken > seg) {
+        throw std::runtime_error(
+            "mori v2 ep: dispTokPerIter must be 2 or 4 with worldSize and topk each <= "
+            "waveSize / dispTokPerIter (got T=" +
+            std::to_string(t) + " world=" + std::to_string(c.worldSize) +
+            " topk=" + std::to_string(c.numExpertPerToken) + ")");
+      }
+      c.dispTokPerIter = t;
+    }
     if (req.warpPerBlock <= 0) c.warpPerBlock = EpDefaultDispatchWarps(c);
+    if ((c.warpPerBlock - EpCtrlWarps(c)) % EpTokPerIter(c) != 0) {
+      throw std::runtime_error(
+          "mori v2 ep: the dispatch's copy warps (warps=" + std::to_string(c.warpPerBlock) +
+          " minus the control warps) must split evenly over "
+          "dispTokPerIter=" +
+          std::to_string(EpTokPerIter(c)) + " tokens");
+    }
     if (c.worldSize > c.waveSize || EpCopyWarps(c) < 1) {
       throw std::runtime_error(
           "mori v2 ep: the intranode dispatch routes with lane p owning destination p, so "
@@ -281,6 +302,7 @@ std::string EpEntryName(const EpCfg& cfg, const char* kind) {
   s += "_h" + std::to_string(cfg.hiddenDim);
   s += "_k" + std::to_string(cfg.numExpertPerToken);
   s += '_' + std::to_string(cfg.blockNum) + 'x' + std::to_string(cfg.warpPerBlock);
+  if (EpTokPerIter(cfg) > 1) s += "_t" + std::to_string(EpTokPerIter(cfg));
   return s;
 }
 

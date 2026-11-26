@@ -303,6 +303,11 @@ def main():
     comm = cco.Communicator.init(world, rank, obj[0], vmm)
 
     def build(backend):
+        # Bench-only pseudo-backends: "hip_t2" = hip with 2 tokens per dispatch
+        # iteration; "@B" pins the dispatch block count (hip_t2@256).
+        name, _, blocks = backend.partition("@")
+        tok_per_iter = int(name.split("_t")[1]) if "_t" in name else 1
+        kernel = name.split("_t")[0]
         cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=world,
@@ -315,8 +320,9 @@ def main():
             combine_data_type=None if _DISP_DT is torch.bfloat16 else torch.bfloat16,
             scale_dim=SCALE_DIM,
             scale_type_size=SCALE_TS,
-            kernel_backend=backend,
-            dispatch_block_num=_G["DBN"],
+            kernel_backend=kernel,
+            dispatch_block_num=int(blocks) if blocks else _G["DBN"],
+            dispatch_tok_per_iter=tok_per_iter,
             warp_num_per_block=_G["DWPB"],
             combine_block_num=_G["CBN"],
             combine_warp_num_per_block=_G["CWPB"],
